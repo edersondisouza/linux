@@ -6,16 +6,164 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 #include <net/if.h>
 #include <linux/if.h>
 #include <linux/rtnetlink.h>
 #include <sys/socket.h>
-#include <uapi/linux/btf.h>
-#include <bpf/libbpf.h>
-#include <bpf/bpf.h>
+
 #include "bpf/nlattr.h"
 #include "main.h"
 #include "netlink_dumper.h"
+
+
+/* TODO: reuse  form net.c */
+#ifndef SOL_NETLINK
+#define SOL_NETLINK 270
+#endif
+
+static int netlink_open(__u32 *nl_pid)
+{
+	struct sockaddr_nl sa;
+	socklen_t addrlen;
+	int one = 1, ret;
+	int sock;
+
+	memset(&sa, 0, sizeof(sa));
+	sa.nl_family = AF_NETLINK;
+
+	sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+	if (sock < 0)
+		return -errno;
+
+	if (setsockopt(sock, SOL_NETLINK, NETLINK_EXT_ACK,
+		       &one, sizeof(one)) < 0) {
+		p_err("Netlink error reporting not supported");
+	}
+
+	if (bind(sock, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+		ret = -errno;
+		goto cleanup;
+	}
+
+	addrlen = sizeof(sa);
+	if (getsockname(sock, (struct sockaddr *)&sa, &addrlen) < 0) {
+		ret = -errno;
+		goto cleanup;
+	}
+
+	if (addrlen != sizeof(sa)) {
+		ret = -LIBBPF_ERRNO__INTERNAL;
+		goto cleanup;
+	}
+
+	*nl_pid = sa.nl_pid;
+	return sock;
+
+cleanup:
+	close(sock);
+	return ret;
+}
+
+typedef int (*dump_nlmsg_t)(void *cookie, void *msg, struct nlattr **tb);
+
+typedef int (*__dump_nlmsg_t)(struct nlmsghdr *nlmsg, dump_nlmsg_t, void *cookie);
+
+static int netlink_recv(int sock, __u32 nl_pid, __u32 seq,
+			__dump_nlmsg_t _fn, dump_nlmsg_t fn,
+			void *cookie)
+{
+	bool multipart = true;
+	struct nlmsgerr *err;
+	struct nlmsghdr *nh;
+	char buf[4096];
+	int len, ret;
+
+	while (multipart) {
+		multipart = false;
+		len = recv(sock, buf, sizeof(buf), 0);
+		if (len < 0) {
+			ret = -errno;
+			goto done;
+		}
+
+		if (len == 0)
+			break;
+
+		for (nh = (struct nlmsghdr *)buf; NLMSG_OK(nh, len);
+		     nh = NLMSG_NEXT(nh, len)) {
+			if (nh->nlmsg_pid != nl_pid) {
+				ret = -LIBBPF_ERRNO__WRNGPID;
+				goto done;
+			}
+			if (nh->nlmsg_seq != seq) {
+				ret = -LIBBPF_ERRNO__INVSEQ;
+				goto done;
+			}
+			if (nh->nlmsg_flags & NLM_F_MULTI)
+				multipart = true;
+			switch (nh->nlmsg_type) {
+			case NLMSG_ERROR:
+				err = (struct nlmsgerr *)NLMSG_DATA(nh);
+				if (!err->error)
+					continue;
+				ret = err->error;
+				libbpf_nla_dump_errormsg(nh);
+				goto done;
+			case NLMSG_DONE:
+				return 0;
+			default:
+				break;
+			}
+			if (_fn) {
+				ret = _fn(nh, fn, cookie);
+				if (ret)
+					return ret;
+			}
+		}
+	}
+	ret = 0;
+done:
+	return ret;
+}
+
+
+static int __dump_link_nlmsg(struct nlmsghdr *nlh,
+			     dump_nlmsg_t dump_link_nlmsg, void *cookie)
+{
+	struct nlattr *tb[IFLA_MAX + 1], *attr;
+	struct ifinfomsg *ifi = NLMSG_DATA(nlh);
+	int len;
+
+	len = nlh->nlmsg_len - NLMSG_LENGTH(sizeof(*ifi));
+	attr = (struct nlattr *) ((void *) ifi + NLMSG_ALIGN(sizeof(*ifi)));
+	if (libbpf_nla_parse(tb, IFLA_MAX, attr, len, NULL) != 0)
+		return -LIBBPF_ERRNO__NLPARSE;
+
+	return dump_link_nlmsg(cookie, ifi, tb);
+}
+
+static int netlink_get_link(int sock, unsigned int nl_pid,
+			    dump_nlmsg_t dump_link_nlmsg, void *cookie)
+{
+	struct {
+		struct nlmsghdr nlh;
+		struct ifinfomsg ifm;
+	} req = {
+		.nlh.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg)),
+		.nlh.nlmsg_type = RTM_GETLINK,
+		.nlh.nlmsg_flags = NLM_F_DUMP | NLM_F_REQUEST,
+		.ifm.ifi_family = AF_PACKET,
+	};
+	int seq = time(NULL);
+
+	req.nlh.nlmsg_seq = seq;
+	if (send(sock, &req, req.nlh.nlmsg_len, 0) < 0)
+		return -errno;
+
+	return netlink_recv(sock, nl_pid, seq, __dump_link_nlmsg,
+			    dump_link_nlmsg, cookie);
+}
 
 struct ip_devname_ifindex {
 	char	devname[64];
@@ -33,7 +181,7 @@ static int do_show(int argc, char **argv)
 {
 	int sock, ret, filter_idx = -1;
 	struct bpf_netdev_t dev_array;
-	unsigned int nl_pid;
+	unsigned int nl_pid = 0;
 	char err_buf[256];
 
 	if (argc == 2) {
@@ -48,7 +196,7 @@ static int do_show(int argc, char **argv)
 		usage();
 	}
 
-	sock = libbpf_netlink_open(&nl_pid);
+	sock = netlink_open(&nl_pid);
 	if (sock < 0) {
 		fprintf(stderr, "failed to open netlink sock\n");
 		return -1;
@@ -63,7 +211,7 @@ static int do_show(int argc, char **argv)
 		jsonw_start_array(json_wtr);
 	NET_START_OBJECT;
 	NET_START_ARRAY("xdp", "%s:\n");
-	ret = libbpf_nl_get_link(sock, nl_pid, xdp_dump_link_nlmsg, &dev_array);
+	ret = netlink_get_link(sock, nl_pid, xdp_dump_link_nlmsg, &dev_array);
 	NET_END_ARRAY("\n");
 
 	NET_END_OBJECT;

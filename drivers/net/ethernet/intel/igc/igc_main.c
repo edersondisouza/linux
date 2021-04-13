@@ -4685,8 +4685,12 @@ static void igc_tsync_interrupt(struct igc_adapter *adapter)
 	}
 
 	if (tsicr & IGC_TSICR_TXTS) {
+		u32 tsynctxctl = rd32(IGC_TSYNCTXCTL);;
+
 		/* retrieve hardware timestamp */
-		schedule_work(&adapter->ptp_tx_work);
+		if (tsynctxctl & IGC_TSYNCTXCTL_TXTT_0)
+			igc_ptp_tx_hwtstamp(adapter);
+
 		ack |= IGC_TSICR_TXTS;
 	}
 

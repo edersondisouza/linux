@@ -541,8 +541,17 @@ static void igc_ptp_enable_tx_timestamp(struct igc_adapter *adapter)
 	wr32(IGC_TSYNCTXCTL, IGC_TSYNCTXCTL_ENABLED | IGC_TSYNCTXCTL_TXSYNSIG);
 
 	/* Read TXSTMP registers to discard any timestamp previously stored. */
-	rd32(IGC_TXSTMPL);
-	rd32(IGC_TXSTMPH);
+	rd32(IGC_TXSTMPL_0);
+	rd32(IGC_TXSTMPH_0);
+
+	rd32(IGC_TXSTMPL_1);
+	rd32(IGC_TXSTMPH_1);
+
+	rd32(IGC_TXSTMPL_2);
+	rd32(IGC_TXSTMPH_2);
+
+	rd32(IGC_TXSTMPL_3);
+	rd32(IGC_TXSTMPH_3);
 }
 
 /**
@@ -599,33 +608,40 @@ static int igc_ptp_set_timestamp_mode(struct igc_adapter *adapter,
 }
 
 /* Requires adapter->ptp_tx_lock held by caller. */
-static void igc_ptp_tx_timeout(struct igc_adapter *adapter)
+static void igc_ptp_tx_timeout(struct igc_adapter *adapter,
+			       struct igc_tx_timestamp_request *tstamp)
 {
 	struct igc_hw *hw = &adapter->hw;
 
-	dev_kfree_skb_any(adapter->ptp_tx_skb);
-	adapter->ptp_tx_skb = NULL;
-	adapter->ptp_tx_start = 0;
+	dev_kfree_skb_any(tstamp->skb);
+	tstamp->skb = NULL;
+	tstamp->start = 0;
 	adapter->tx_hwtstamp_timeouts++;
 	/* Clear the tx valid bit in TSYNCTXCTL register to enable interrupt. */
-	rd32(IGC_TXSTMPH);
+	rd32(tstamp->regh);
 
 	netdev_warn(adapter->netdev, "Tx timestamp timeout\n");
 }
 
 void igc_ptp_tx_hang(struct igc_adapter *adapter)
 {
+	struct igc_tx_timestamp_request *tstamp;
+	int i;
+
 	spin_lock(&adapter->ptp_tx_lock);
 
-	if (!adapter->ptp_tx_skb)
-		goto unlock;
+	for (i = 0; i < IGC_MAX_TX_TSTAMP_TIMERS; i++) {
+		tstamp = &adapter->tx_tstamp[i];
 
-	if (time_is_after_jiffies(adapter->ptp_tx_start + IGC_PTP_TX_TIMEOUT))
-		goto unlock;
+		if (!tstamp->skb)
+			continue;
 
-	igc_ptp_tx_timeout(adapter);
+		if (time_is_after_jiffies(tstamp->start + IGC_PTP_TX_TIMEOUT))
+			continue;
 
-unlock:
+		igc_ptp_tx_timeout(adapter, tstamp);
+	}
+
 	spin_unlock(&adapter->ptp_tx_lock);
 }
 
@@ -639,56 +655,72 @@ unlock:
  *
  * Context: Expects adapter->ptp_tx_lock to be held by caller.
  */
-void igc_ptp_tx_hwtstamp(struct igc_adapter *adapter)
+void igc_ptp_tx_hwtstamp(struct igc_adapter *adapter, u32 mask)
 {
 	struct skb_shared_hwtstamps shhwtstamps;
 	struct igc_hw *hw = &adapter->hw;
 	struct sk_buff *skb;
 	int adjust = 0;
 	u64 regval;
+	int i;
 
+again:
 	spin_lock(&adapter->ptp_tx_lock);
-	skb = adapter->ptp_tx_skb;
 
-	if (WARN_ON_ONCE(!skb))
-		goto done;
+	for (i = 0; i < IGC_MAX_TX_TSTAMP_TIMERS; i++) {
+		struct igc_tx_timestamp_request *tstamp = &adapter->tx_tstamp[i];
 
-	regval = rd32(IGC_TXSTMPL);
-	regval |= (u64)rd32(IGC_TXSTMPH) << 32;
-	igc_ptp_systim_to_hwtstamp(adapter, &shhwtstamps, regval);
+		if (!(mask & tstamp->mask))
+			continue;
 
-	switch (adapter->link_speed) {
-	case SPEED_10:
-		adjust = IGC_I225_TX_LATENCY_10;
-		break;
-	case SPEED_100:
-		adjust = IGC_I225_TX_LATENCY_100;
-		break;
-	case SPEED_1000:
-		adjust = IGC_I225_TX_LATENCY_1000;
-		break;
-	case SPEED_2500:
-		adjust = IGC_I225_TX_LATENCY_2500;
-		break;
+		skb = tstamp->skb;
+		if (!skb)
+			continue;
+
+		regval = rd32(tstamp->regl);
+		regval |= (u64)rd32(tstamp->regh) << 32;
+		igc_ptp_systim_to_hwtstamp(adapter, &shhwtstamps, regval);
+
+		switch (adapter->link_speed) {
+		case SPEED_10:
+			adjust = IGC_I225_TX_LATENCY_10;
+			break;
+		case SPEED_100:
+			adjust = IGC_I225_TX_LATENCY_100;
+			break;
+		case SPEED_1000:
+			adjust = IGC_I225_TX_LATENCY_1000;
+			break;
+		case SPEED_2500:
+			adjust = IGC_I225_TX_LATENCY_2500;
+			break;
+		}
+
+		shhwtstamps.hwtstamp =
+			ktime_add_ns(shhwtstamps.hwtstamp, adjust);
+
+		/* Clear the lock early before calling skb_tstamp_tx so that
+		 * applications are not woken up before the lock bit is clear. We use
+		 * a copy of the skb pointer to ensure other threads can't change it
+		 * while we're notifying the stack.
+		 */
+		tstamp->skb = NULL;
+		tstamp->start = 0;
+
+		/* Notify the stack and free the skb after we've unlocked */
+		skb_tstamp_tx(skb, &shhwtstamps);
+		dev_kfree_skb_any(skb);
 	}
 
-	shhwtstamps.hwtstamp =
-		ktime_add_ns(shhwtstamps.hwtstamp, adjust);
-
-	/* Clear the lock early before calling skb_tstamp_tx so that
-	 * applications are not woken up before the lock bit is clear. We use
-	 * a copy of the skb pointer to ensure other threads can't change it
-	 * while we're notifying the stack.
-	 */
-	adapter->ptp_tx_skb = NULL;
-	adapter->ptp_tx_start = 0;
-
-	/* Notify the stack and free the skb after we've unlocked */
-	skb_tstamp_tx(skb, &shhwtstamps);
-	dev_kfree_skb_any(skb);
-
-done:
 	spin_unlock(&adapter->ptp_tx_lock);
+
+	mask = rd32(IGC_TSYNCTXCTL) & IGC_TSYNCTXCTL_TXTT_ANY;
+	if (mask) {
+		/* Some timestamps arrived while we were handling the
+		 * previous ones
+		 */
+		goto again;
+	}
 
 }
 
@@ -747,8 +779,33 @@ int igc_ptp_get_ts_config(struct net_device *netdev, struct ifreq *ifr)
 void igc_ptp_init(struct igc_adapter *adapter)
 {
 	struct net_device *netdev = adapter->netdev;
+	struct igc_tx_timestamp_request *tstamp;
 	struct igc_hw *hw = &adapter->hw;
 	int i;
+
+	tstamp = &adapter->tx_tstamp[0];
+	tstamp->mask = IGC_TSYNCTXCTL_TXTT_0;
+	tstamp->regl = IGC_TXSTMPL_0;
+	tstamp->regh = IGC_TXSTMPH_0;
+	tstamp->flags = 0;
+
+	tstamp = &adapter->tx_tstamp[1];
+	tstamp->mask = IGC_TSYNCTXCTL_TXTT_1;
+	tstamp->regl = IGC_TXSTMPL_1;
+	tstamp->regh = IGC_TXSTMPH_1;
+	tstamp->flags = IGC_TX_FLAGS_TSTAMP_1;
+
+	tstamp = &adapter->tx_tstamp[2];
+	tstamp->mask = IGC_TSYNCTXCTL_TXTT_2;
+	tstamp->regl = IGC_TXSTMPL_2;
+	tstamp->regh = IGC_TXSTMPH_2;
+	tstamp->flags = IGC_TX_FLAGS_TSTAMP_2;
+
+	tstamp = &adapter->tx_tstamp[3];
+	tstamp->mask = IGC_TSYNCTXCTL_TXTT_3;
+	tstamp->regl = IGC_TXSTMPL_3;
+	tstamp->regh = IGC_TXSTMPH_3;
+	tstamp->flags = IGC_TX_FLAGS_TSTAMP_3;
 
 	switch (hw->mac.type) {
 	case igc_i225:
@@ -817,6 +874,19 @@ static void igc_ptp_time_restore(struct igc_adapter *adapter)
 	igc_ptp_write_i225(adapter, &ts);
 }
 
+static void igc_tx_tstamp_clear(struct igc_adapter *adapter)
+{
+	int i;
+
+	for (i = 0; i < IGC_MAX_TX_TSTAMP_TIMERS; i++) {
+		struct igc_tx_timestamp_request *tstamp = &adapter->tx_tstamp[i];
+
+		dev_kfree_skb_any(tstamp->skb);
+		tstamp->skb = NULL;
+		tstamp->start = 0;
+	}
+}
+
 /**
  * igc_ptp_suspend - Disable PTP work items and prepare for suspend
  * @adapter: Board private structure
@@ -831,9 +901,7 @@ void igc_ptp_suspend(struct igc_adapter *adapter)
 
 	spin_lock(&adapter->ptp_tx_lock);
 
-	dev_kfree_skb_any(adapter->ptp_tx_skb);
-	adapter->ptp_tx_skb = NULL;
-	adapter->ptp_tx_start = 0;
+	igc_tx_tstamp_clear(adapter);
 
 	spin_unlock(&adapter->ptp_tx_lock);
 

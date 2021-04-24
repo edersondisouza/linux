@@ -1467,9 +1467,10 @@ static netdev_tx_t igc_xmit_frame_ring(struct sk_buff *skb,
 
 	if (unlikely(skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP)) {
 		struct igc_adapter *adapter = netdev_priv(tx_ring->netdev);
+		unsigned long flags;
 		u32 tstamp_flags;
 
-		spin_lock(&adapter->ptp_tx_lock);
+		spin_lock_irqsave(&adapter->ptp_tx_lock, flags);
 
 		if (adapter->tstamp_config.tx_type == HWTSTAMP_TX_ON &&
 		    igc_request_tx_tstamp(adapter, skb, &tstamp_flags)) {
@@ -1479,7 +1480,7 @@ static netdev_tx_t igc_xmit_frame_ring(struct sk_buff *skb,
 			adapter->tx_hwtstamp_skipped++;
 		}
 
-		spin_unlock(&adapter->ptp_tx_lock);
+		spin_unlock_irqrestore(&adapter->ptp_tx_lock, flags);
 	}
 
 	if (skb_vlan_tag_present(skb)) {

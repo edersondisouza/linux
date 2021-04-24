@@ -626,9 +626,10 @@ static void igc_ptp_tx_timeout(struct igc_adapter *adapter,
 void igc_ptp_tx_hang(struct igc_adapter *adapter)
 {
 	struct igc_tx_timestamp_request *tstamp;
+	unsigned long flags;
 	int i;
 
-	spin_lock(&adapter->ptp_tx_lock);
+	spin_lock_irqsave(&adapter->ptp_tx_lock, flags);
 
 	for (i = 0; i < IGC_MAX_TX_TSTAMP_TIMERS; i++) {
 		tstamp = &adapter->tx_tstamp[i];
@@ -642,7 +643,7 @@ void igc_ptp_tx_hang(struct igc_adapter *adapter)
 		igc_ptp_tx_timeout(adapter, tstamp);
 	}
 
-	spin_unlock(&adapter->ptp_tx_lock);
+	spin_unlock_irqrestore(&adapter->ptp_tx_lock, flags);
 }
 
 /**
@@ -659,13 +660,14 @@ void igc_ptp_tx_hwtstamp(struct igc_adapter *adapter, u32 mask)
 {
 	struct skb_shared_hwtstamps shhwtstamps;
 	struct igc_hw *hw = &adapter->hw;
+	unsigned long flags;
 	struct sk_buff *skb;
 	int adjust = 0;
 	u64 regval;
 	int i;
 
 again:
-	spin_lock(&adapter->ptp_tx_lock);
+	spin_lock_irqsave(&adapter->ptp_tx_lock, flags);
 
 	for (i = 0; i < IGC_MAX_TX_TSTAMP_TIMERS; i++) {
 		struct igc_tx_timestamp_request *tstamp = &adapter->tx_tstamp[i];
@@ -712,7 +714,7 @@ again:
 		dev_kfree_skb_any(skb);
 	}
 
-	spin_unlock(&adapter->ptp_tx_lock);
+	spin_unlock_irqrestore(&adapter->ptp_tx_lock, flags);
 
 	mask = rd32(IGC_TSYNCTXCTL) & IGC_TSYNCTXCTL_TXTT_ANY;
 	if (mask) {
@@ -896,14 +898,16 @@ static void igc_tx_tstamp_clear(struct igc_adapter *adapter)
  */
 void igc_ptp_suspend(struct igc_adapter *adapter)
 {
+	unsigned long flags;
+
 	if (!(adapter->ptp_flags & IGC_PTP_ENABLED))
 		return;
 
-	spin_lock(&adapter->ptp_tx_lock);
+	spin_lock_irqsave(&adapter->ptp_tx_lock, flags);
 
 	igc_tx_tstamp_clear(adapter);
 
-	spin_unlock(&adapter->ptp_tx_lock);
+	spin_unlock_irqrestore(&adapter->ptp_tx_lock, flags);
 
 	igc_ptp_time_save(adapter);
 }

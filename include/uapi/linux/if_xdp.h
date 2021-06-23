@@ -12,6 +12,11 @@
 
 #include <linux/types.h>
 
+#define XDP_GENERIC_HINTS_EXTENDED (1 << 0)
+#define XDP_GENERIC_HINTS_RX_TIMESTAMP (1 << 1)
+#define XDP_GENERIC_HINTS_TX_TIMESTAMP (1 << 2)
+#define XDP_GENERIC_HINTS_HASH32 (1 << 3)
+
 /* Options for the sxdp_flags field */
 #define XDP_SHARED_UMEM	(1 << 0)
 #define XDP_COPY	(1 << 1) /* Force copy-mode */

@@ -76,6 +76,73 @@ struct xdp_buff {
 	u32 frame_sz; /* frame size to deduce data_hard_end/reserved tailroom*/
 };
 
+/*************************************************************************/
+/* TODO this probably deserves its own .h file, xdp_hints.h */
+/*
+
+  struct xdp_hints {
+    u64 rx_timestamp;
+    u64 tx_timestamp;
+    u32 hash32;
+    u32 extension_id;
+    u64 field_map;
+  };
+*/
+
+/* New fields need to be added at the beginning, not at the end,
+ * as the known position on the metadata is the end (just before
+ * the data starts) */
+
+#define XDP_GENERIC_HINTS_STRUCT_MEMBERS \
+    u64 rx_timestamp; \
+    u64 tx_timestamp; \
+    u32 hash32; \
+    u32 extension_id; \
+    u64 field_map;
+
+#define BTF_INFO_ENC(kind, kind_flag, vlen) \
+        ((!!(kind_flag) << 31) | ((kind) << 24) | ((vlen) & BTF_MAX_VLEN))
+
+#define BTF_TYPE_ENC(name, info, size_or_type) \
+        (name), (info), (size_or_type)
+
+#define BTF_INT_ENC(encoding, bits_offset, nr_bits) \
+        ((encoding) << 24 | (bits_offset) << 16 | (nr_bits))
+
+#define BTF_TYPE_INT_ENC(name, encoding, bits_offset, bits, sz) \
+        BTF_TYPE_ENC(name, BTF_INFO_ENC(BTF_KIND_INT, 0, 0), sz),       \
+        BTF_INT_ENC(encoding, bits_offset, bits)
+
+#define BTF_STRUCT_ENC(name, nr_elems, sz)      \
+        BTF_TYPE_ENC(name, BTF_INFO_ENC(BTF_KIND_STRUCT, 1, nr_elems), sz)
+
+#define BTF_MEMBER_ENC(name, type, bits_offset) \
+        (name), (type), (bits_offset)
+
+#define XDP_GENERIC_MD_SUPPORTED_HINTS_NUM_MMBRS 5
+#define XDP_GENERIC_HINTS_NAME_OFFSET 67
+
+#define XDP_GENERIC_HINTS_NAMES "\0xdp_hints\0rx_timestamp\0tx_timestamp\0hash32\0extension_id\0field_map\0"
+
+#define XDP_GENERIC_HINTS_TYPES \
+        BTF_TYPE_INT_ENC(0, 0, 0, 64, 8), \
+        BTF_TYPE_INT_ENC(0, 0, 0, 32, 4)
+
+#define XDP_GENERIC_HINTS_STRUCT(nr_elems, sz) \
+        BTF_STRUCT_ENC(1, XDP_GENERIC_MD_SUPPORTED_HINTS_NUM_MMBRS + nr_elems, \
+                8 + 8 + 4 + 4 + 8 + sz)
+
+#define XDP_GENERIC_HINTS_MEMBERS(offset) \
+        BTF_MEMBER_ENC(11, 1, offset + 0), \
+        BTF_MEMBER_ENC(24, 1, offset + 64), \
+        BTF_MEMBER_ENC(37, 2, offset + 128), \
+        BTF_MEMBER_ENC(44, 2, offset + 160), \
+        BTF_MEMBER_ENC(57, 1, offset + 192)
+
+#define XDP_GENERIC_HINTS_BIT_MAX   XDP_GENERIC_HINTS_HASH32
+
+/*************************************************************************/
+
 static __always_inline void
 xdp_init_buff(struct xdp_buff *xdp, u32 frame_sz, struct xdp_rxq_info *rxq)
 {

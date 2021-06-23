@@ -207,14 +207,13 @@ int main(int argc, char **argv)
 	struct bpf_prog_load_attr prog_load_attr = {
 		.prog_type	= BPF_PROG_TYPE_XDP,
 	};
-	int min_port = 0, max_port = 0, vip2tnl_map_fd;
+	int min_port = 0, max_port = 0, vip2tnl_map_fd, mport;
 	const char *optstr = "i:a:p:s:d:m:T:P:FSNh";
 	unsigned char opt_flags[256] = {};
 	struct bpf_prog_info info = {};
 	__u32 info_len = sizeof(info);
 	unsigned int kill_after_s = 0;
 	struct iptnl_info tnl = {};
-	int mport, vip2tnl_map_fd;
 	struct bpf_object *obj;
 	struct vip vip = {};
 	char *ipstr = NULL;

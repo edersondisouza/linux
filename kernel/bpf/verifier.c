@@ -9436,15 +9436,13 @@ static int check_btf_func(struct bpf_verifier_env *env,
 			  const union bpf_attr *attr,
 			  union bpf_attr __user *uattr)
 {
-	const struct btf_type *type, *func_proto, *ret_type;
+	const struct btf_type *type, *ret_type;
 	u32 i, nfuncs, urec_size, min_size;
 	u32 krec_size = sizeof(struct bpf_func_info);
 	struct bpf_func_info *krecord;
 	struct bpf_func_info_aux *info_aux = NULL;
 	struct bpf_prog *prog;
-	const struct btf_type *type;
 	const struct btf *btf;
-	struct bpf_prog *prog;
 	void __user *urecord;
 	u32 prev_offset = 0;
 	bool scalar_return;

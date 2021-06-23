@@ -31,6 +31,11 @@ static int ifindex;
 static __u32 xdp_flags = XDP_FLAGS_UPDATE_IF_NOEXIST;
 static __u32 prog_id;
 
+static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
+{
+	return vfprintf(stderr, format, args);
+}
+
 static void int_exit(int sig)
 {
 	__u32 curr_prog_id = 0;
@@ -48,7 +53,7 @@ static void int_exit(int sig)
 	exit(0);
 }
 
-static void poll_stats(int map_fd, int interval)
+static void poll_stats(int map_fd, int interval, bool timestamp)
 {
 	unsigned int nr_cpus = bpf_num_possible_cpus();
 	__u64 values[nr_cpus];
@@ -64,8 +69,12 @@ static void poll_stats(int map_fd, int interval)
 
 			assert(bpf_map_lookup_elem(map_fd, &key, values) == 0);
 			for (i = 0; i < nr_cpus; i++)
-				if (values[i])
-					printf("hash is %x\n", values[i]);
+				if (values[i]) {
+					if (timestamp)
+						printf("RX timestamp: %llu\n", values[i]);
+					else
+						printf("hash is %x\n", values[i]);
+				}
 		}
 	}
 }
@@ -95,6 +104,10 @@ int main(int argc, char **argv)
 	struct bpf_object *obj;
 	struct bpf_map *map;
 	int err;
+	bool timestamp = false;
+
+	/* Set up libbpf errors and debug info callback */
+	libbpf_set_print(libbpf_print_fn);
 
 	while ((opt = getopt(argc, argv, ":HT")) != -1) {
 		switch (opt) {
@@ -105,6 +118,7 @@ int main(int argc, char **argv)
 		case 'T':
 			prog_name = "xdp_hints_timestamp_prog";
 			filename = "xdp_hints_timestamp_kern.o";
+			timestamp = true;
 			break;
 		default:
 			usage(basename(argv[0]));
@@ -161,7 +175,7 @@ int main(int argc, char **argv)
 	}
 	prog_id = info.id;
 
-	poll_stats(map_fd, 2);
+	poll_stats(map_fd, 2, timestamp);
 
 	return 0;
 }

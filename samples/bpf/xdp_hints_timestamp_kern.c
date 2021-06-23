@@ -8,6 +8,7 @@
 #define KBUILD_MODNAME "foo"
 #include <uapi/linux/bpf.h>
 #include <bpf/bpf_helpers.h>
+#include <bpf/bpf_core_read.h>
 #include <linux/btf.h>
 
 struct {
@@ -17,32 +18,36 @@ struct {
 	__uint(max_entries, 256);
 } packet_info SEC(".maps");
 
-struct hints_hdr {
-	__u32 timestamp;
+struct xdp_hints {
+	u64 rx_timestamp;
 };
 
-BTF_XDP_USE_HINTS(struct hints_hdr);
+struct xdp_hints___igc {
+	u64 rx_timestamp;
+	u64 yet_another_timestamp;
+};
 
 SEC("xdp_hints_hash")
 int xdp_hints_hash_prog(struct xdp_md *ctx)
 {
-	struct hints_hdr *meta = (struct hints_hdr *)(long)ctx->data_meta;
+	struct xdp_hints *meta = (void *)(long)ctx->data_meta;
 	void *data_end = (void *)(long)ctx->data_end;
 	void *data = (void *)(long)ctx->data;
 	int rc = XDP_DROP;
 	long *value;
 	u32 key = 0;
+	long size, meta_size, val;
 
-	if (meta + 1 > data)
-		return rc;
+	if (meta + 1 <= data) {
+		value = bpf_map_lookup_elem(&packet_info, &key);
+		if (value)
+			*value = BPF_CORE_READ(meta, rx_timestamp);
 
-	if (data + 1 > data_end)
-		return rc;
-
-	value = bpf_map_lookup_elem(&packet_info, &key);
-	if (value)
-		*value = meta->timestamp;
-
+		/* Just to show how access to specific driver hints would be */
+		val = BPF_CORE_READ((struct xdp_hints___igc *)meta,
+				yet_another_timestamp);
+		bpf_printk("yet another timestamp %lu", val);
+	}
 	return rc;
 }
 

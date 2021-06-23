@@ -13,6 +13,7 @@
 #include <linux/ptp_clock_kernel.h>
 #include <linux/timecounter.h>
 #include <linux/net_tstamp.h>
+#include <linux/if_xdp.h>
 
 #include "igc_hw.h"
 
@@ -237,6 +238,9 @@ struct igc_adapter {
 		struct timespec64 start;
 		struct timespec64 period;
 	} perout[IGC_N_PEROUT];
+
+	struct btf *btf;
+	u8 btf_enabled;
 };
 
 void igc_up(struct igc_adapter *adapter);

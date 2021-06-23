@@ -13,6 +13,7 @@
 #include <linux/bpf_trace.h>
 #include <net/xdp_sock_drv.h>
 #include <net/ipv6.h>
+#include <linux/btf.h>
 
 #include "igc.h"
 #include "igc_hw.h"
@@ -2283,8 +2284,20 @@ static int igc_clean_rx_irq(struct igc_q_vector *q_vector, const int budget)
 
 		if (!skb) {
 			xdp_init_buff(&xdp, truesize, &rx_ring->xdp_rxq);
+
 			xdp_prepare_buff(&xdp, pktbuf - igc_rx_offset(rx_ring),
-					 igc_rx_offset(rx_ring) + pkt_offset, size, false);
+					 igc_rx_offset(rx_ring) + pkt_offset, size,
+					 adapter->btf_enabled);
+
+			if (adapter->btf_enabled) {
+				struct xdp_hints___igc *hints;
+
+				pr_warn("non-zc ts %lu", timestamp);
+				hints = xdp.data - sizeof(*hints);
+				xdp.data_meta = hints;
+				hints->rx_timestamp = timestamp;
+				hints->field_map = XDP_GENERIC_HINTS_RX_TIMESTAMP;
+			}
 
 			skb = igc_xdp_run_prog(adapter, &xdp);
 		}
@@ -2448,12 +2461,18 @@ static int igc_clean_rx_irq_zc(struct igc_q_vector *q_vector, const int budget)
 							bi->xdp->data);
 
 			bi->xdp->data += IGC_TS_HDR_LEN;
-
-			/* HW timestamp has been copied into local variable. Metadata
-			 * length when XDP program is called should be 0.
-			 */
 			bi->xdp->data_meta += IGC_TS_HDR_LEN;
 			size -= IGC_TS_HDR_LEN;
+
+			if (adapter->btf_enabled) {
+				struct xdp_hints___igc *hints;
+
+				pr_warn("zc ts %lu", timestamp);
+				hints = bi->xdp->data - sizeof(*hints);
+				bi->xdp->data_meta = hints;
+				hints->rx_timestamp = timestamp;
+				hints->field_map = XDP_GENERIC_HINTS_RX_TIMESTAMP;
+			}
 		}
 
 		bi->xdp->data_end = bi->xdp->data + size;
@@ -5536,6 +5555,12 @@ static int igc_bpf(struct net_device *dev, struct netdev_bpf *bpf)
 	case XDP_SETUP_XSK_POOL:
 		return igc_xdp_setup_pool(adapter, bpf->xsk.pool,
 					  bpf->xsk.queue_id);
+	case XDP_SETUP_MD_BTF:
+		return igc_xdp_set_btf_md(dev, bpf->btf_enable);
+	case XDP_QUERY_MD_BTF:
+		bpf->btf_id = igc_xdp_query_btf(dev, &bpf->btf_enable);
+		return 0;
+
 	default:
 		return -EOPNOTSUPP;
 	}
@@ -6017,6 +6042,11 @@ static void igc_remove(struct pci_dev *pdev)
 
 	cancel_work_sync(&adapter->reset_task);
 	cancel_work_sync(&adapter->watchdog_task);
+
+	if (adapter->btf) {
+		adapter->btf_enabled = 0;
+		btf_unregister(adapter->btf);
+	}
 
 	/* Release control of h/w to f/w.  If f/w is AMT enabled, this
 	 * would have already happened in close and is redundant.

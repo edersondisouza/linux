@@ -2,9 +2,104 @@
 /* Copyright (c) 2020, Intel Corporation. */
 
 #include <net/xdp_sock_drv.h>
+#include <linux/btf.h>
 
 #include "igc.h"
 #include "igc_xdp.h"
+
+#define IGC_XDP_HINTS_NUM_MMBRS 1
+static const char names_str[] = XDP_GENERIC_HINTS_NAMES "yet_another_timestamp\0";
+
+/**
+ * struct igc_xdp_hints {
+ *      u64 yet_another_timestamp;
+ *      { generic_xdp_hints }
+ * }
+ */
+
+static const u32 igc_xdp_hints_raw[] = {
+	XDP_GENERIC_HINTS_TYPES,
+	XDP_GENERIC_HINTS_STRUCT(IGC_XDP_HINTS_NUM_MMBRS, 8),
+	BTF_MEMBER_ENC(XDP_GENERIC_HINTS_NAME_OFFSET, 1, 0),
+	XDP_GENERIC_HINTS_MEMBERS(64),
+};
+
+static int igc_xdp_register_btf(struct igc_adapter *priv)
+{
+	unsigned int type_sec_sz, str_sec_sz;
+	char *types_sec, *str_sec;
+	struct btf_header *hdr;
+	unsigned int btf_size;
+	void *raw_btf = NULL;
+	int err = 0;
+
+	type_sec_sz = sizeof(igc_xdp_hints_raw);
+	str_sec_sz  = sizeof(names_str);
+
+	btf_size = sizeof(*hdr) + type_sec_sz + str_sec_sz;
+	raw_btf = kzalloc(btf_size, GFP_KERNEL);
+	if (!raw_btf)
+		return -ENOMEM;
+
+	hdr = raw_btf;
+	hdr->magic	= BTF_MAGIC;
+	hdr->version  = BTF_VERSION;
+	hdr->hdr_len  = sizeof(*hdr);
+	hdr->type_off = 0;
+	hdr->type_len = type_sec_sz;
+	hdr->str_off  = type_sec_sz;
+	hdr->str_len  = str_sec_sz;
+
+	types_sec = raw_btf   + sizeof(*hdr);
+	str_sec   = types_sec + type_sec_sz;
+	memcpy(types_sec, igc_xdp_hints_raw, type_sec_sz);
+	memcpy(str_sec, names_str, str_sec_sz);
+
+	priv->btf = btf_register(raw_btf, btf_size);
+	if (IS_ERR(priv->btf)) {
+		err = PTR_ERR(priv->btf);
+		priv->btf = NULL;
+		netdev_err(priv->netdev, "failed to register BTF MD, err (%d)\n", err);
+	}
+
+	kfree(raw_btf);
+	return err;
+}
+
+int igc_xdp_query_btf(struct net_device *dev, u8 *enabled)
+{
+	struct igc_adapter *priv = netdev_priv(dev);
+	u32 md_btf_id = 0;
+
+	if (!IS_ENABLED(CONFIG_BPF_SYSCALL))
+		return md_btf_id;
+
+	if (!priv->btf)
+		igc_xdp_register_btf(priv);
+
+	*enabled = !!priv->btf_enabled;
+	md_btf_id = priv->btf ? btf_obj_id(priv->btf) : 0;
+
+	return md_btf_id;
+}
+
+int igc_xdp_set_btf_md(struct net_device *dev, u8 enable)
+{
+	struct igc_adapter *priv = netdev_priv(dev);
+	int err = 0;
+
+	if (enable && !priv->btf) {
+		igc_xdp_register_btf(priv);
+		if (!priv->btf) {
+			err = -EINVAL;
+			goto unlock;
+		}
+	}
+
+	priv->btf_enabled = enable;
+unlock:
+	return err;
+}
 
 int igc_xdp_set_prog(struct igc_adapter *adapter, struct bpf_prog *prog,
 		     struct netlink_ext_ack *extack)

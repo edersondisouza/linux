@@ -8,6 +8,7 @@
 
 #include "igc.h"
 #include "igc_diag.h"
+#include "igc_xdp.h"
 
 /* forward declaration */
 struct igc_stats {
@@ -156,6 +157,7 @@ static void igc_ethtool_get_drvinfo(struct net_device *netdev,
 		sizeof(drvinfo->bus_info));
 
 	drvinfo->n_priv_flags = IGC_PRIV_FLAGS_STR_LEN;
+	drvinfo->xdp_headroom = XDP_PACKET_HEADROOM;
 }
 
 static int igc_ethtool_get_regs_len(struct net_device *netdev)

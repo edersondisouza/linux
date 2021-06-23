@@ -66,11 +66,23 @@ struct igc_rx_packet_stats {
 	u64 other_packets;
 };
 
+enum igc_tx_buffer_type {
+	IGC_TX_BUFFER_TYPE_SKB,
+	IGC_TX_BUFFER_TYPE_XDP,
+	IGC_TX_BUFFER_TYPE_XSK,
+};
+
 #define IGC_MAX_TX_TSTAMP_TIMERS	4
 
 struct igc_tx_timestamp_request {
-	struct sk_buff *skb;
+	union igc_pending_ts_pkt {
+		struct sk_buff *skb;
+		struct xdp_desc xsk_desc;
+		void *ptr;
+	} pending_ts_pkt;
+	struct xsk_buff_pool *xsk_pool;
 	unsigned long start;
+	enum igc_tx_buffer_type type;
 	u32 mask;
 	u32 regl;
 	u32 regh;
@@ -433,12 +445,6 @@ enum igc_boards {
 #define TXD_USE_COUNT(S)	DIV_ROUND_UP((S), IGC_MAX_DATA_PER_TXD)
 #define DESC_NEEDED	(MAX_SKB_FRAGS + 4)
 
-enum igc_tx_buffer_type {
-	IGC_TX_BUFFER_TYPE_SKB,
-	IGC_TX_BUFFER_TYPE_XDP,
-	IGC_TX_BUFFER_TYPE_XSK,
-};
-
 /* wrapper around a pointer to a socket buffer,
  * so a DMA handle can be stored along with the buffer
  */
@@ -449,6 +455,7 @@ struct igc_tx_buffer {
 	union {
 		struct sk_buff *skb;
 		struct xdp_frame *xdpf;
+		struct xdp_desc xsk_desc;
 	};
 	unsigned int bytecount;
 	u16 gso_segs;
@@ -617,6 +624,7 @@ int igc_ptp_set_ts_config(struct net_device *netdev, struct ifreq *ifr);
 int igc_ptp_get_ts_config(struct net_device *netdev, struct ifreq *ifr);
 void igc_ptp_tx_hang(struct igc_adapter *adapter);
 void igc_ptp_read(struct igc_adapter *adapter, struct timespec64 *ts);
+ktime_t igc_retrieve_ptp_tx_timestamp(struct igc_adapter *adapter);
 
 #define igc_rx_pg_size(_ring) (PAGE_SIZE << igc_rx_pg_order(_ring))
 

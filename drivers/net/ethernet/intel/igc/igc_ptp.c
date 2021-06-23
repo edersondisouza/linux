@@ -9,6 +9,9 @@
 #include <linux/ptp_classify.h>
 #include <linux/clocksource.h>
 #include <linux/ktime.h>
+#include <net/xdp_sock_drv.h>
+
+#include "igc_xdp.h"
 
 #define INCVALUE_MASK		0x7fffffff
 #define ISGN			0x80000000
@@ -613,9 +616,10 @@ static void igc_ptp_tx_timeout(struct igc_adapter *adapter,
 {
 	struct igc_hw *hw = &adapter->hw;
 
-	dev_kfree_skb_any(tstamp->skb);
-	tstamp->skb = NULL;
+	if (tstamp->type == IGC_TX_BUFFER_TYPE_SKB)
+		dev_kfree_skb_any(tstamp->pending_ts_pkt.skb);
 	tstamp->start = 0;
+	tstamp->pending_ts_pkt.ptr = NULL;
 	adapter->tx_hwtstamp_timeouts++;
 	/* Clear the tx valid bit in TSYNCTXCTL register to enable interrupt. */
 	rd32(tstamp->regh);
@@ -634,7 +638,7 @@ void igc_ptp_tx_hang(struct igc_adapter *adapter)
 	for (i = 0; i < IGC_MAX_TX_TSTAMP_TIMERS; i++) {
 		tstamp = &adapter->tx_tstamp[i];
 
-		if (!tstamp->skb)
+		if (!tstamp->start)
 			continue;
 
 		if (time_is_after_jiffies(tstamp->start + IGC_PTP_TX_TIMEOUT))
@@ -661,7 +665,6 @@ void igc_ptp_tx_hwtstamp(struct igc_adapter *adapter, u32 mask)
 	struct skb_shared_hwtstamps shhwtstamps;
 	struct igc_hw *hw = &adapter->hw;
 	unsigned long flags;
-	struct sk_buff *skb;
 	int adjust = 0;
 	u64 regval;
 	int i;
@@ -675,12 +678,13 @@ again:
 		if (!(mask & tstamp->mask))
 			continue;
 
-		skb = tstamp->skb;
-		if (!skb)
-			continue;
-
+		/* Always need to read register, to clean interrupt cause */
 		regval = rd32(tstamp->regl);
 		regval |= (u64)rd32(tstamp->regh) << 32;
+
+		if (!tstamp->pending_ts_pkt.ptr)
+			continue;
+
 		igc_ptp_systim_to_hwtstamp(adapter, &shhwtstamps, regval);
 
 		switch (adapter->link_speed) {
@@ -706,12 +710,26 @@ again:
 		 * a copy of the skb pointer to ensure other threads can't change it
 		 * while we're notifying the stack.
 		 */
-		tstamp->skb = NULL;
 		tstamp->start = 0;
 
 		/* Notify the stack and free the skb after we've unlocked */
-		skb_tstamp_tx(skb, &shhwtstamps);
-		dev_kfree_skb_any(skb);
+		if (tstamp->type == IGC_TX_BUFFER_TYPE_SKB) {
+			skb_tstamp_tx(tstamp->pending_ts_pkt.skb, &shhwtstamps);
+			dev_kfree_skb_any(tstamp->pending_ts_pkt.skb);
+			tstamp->pending_ts_pkt.ptr = NULL;
+		} else if (tstamp->type == IGC_TX_BUFFER_TYPE_XSK) {
+			struct xdp_meta_generic___igc *hints;
+			struct xsk_buff_pool *pool;
+			struct xdp_desc xdp_desc;
+
+			pool = tstamp->xsk_pool;
+			xdp_desc = tstamp->pending_ts_pkt.xsk_desc;
+			hints = (struct xdp_meta_generic___igc *)
+				((char *)xsk_buff_raw_get_data(pool, xdp_desc.addr)
+				 - sizeof(*hints));
+			hints->tx_tstamp = shhwtstamps.hwtstamp;
+			hints->btf_id = adapter->btf_id;
+		}
 	}
 
 	spin_unlock_irqrestore(&adapter->ptp_tx_lock, flags);
@@ -883,8 +901,10 @@ static void igc_tx_tstamp_clear(struct igc_adapter *adapter)
 	for (i = 0; i < IGC_MAX_TX_TSTAMP_TIMERS; i++) {
 		struct igc_tx_timestamp_request *tstamp = &adapter->tx_tstamp[i];
 
-		dev_kfree_skb_any(tstamp->skb);
-		tstamp->skb = NULL;
+		if (tstamp->pending_ts_pkt.ptr && tstamp->type == IGC_TX_BUFFER_TYPE_SKB)
+			dev_kfree_skb_any(tstamp->pending_ts_pkt.skb);
+
+		tstamp->pending_ts_pkt.ptr = NULL;
 		tstamp->start = 0;
 	}
 }

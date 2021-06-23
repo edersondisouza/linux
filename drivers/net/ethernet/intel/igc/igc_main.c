@@ -1158,7 +1158,8 @@ static u32 igc_tx_cmd_type(struct sk_buff *skb, u32 tx_flags)
 				 (IGC_ADVTXD_TSTAMP_REG_3));
 
 	/* insert frame checksum */
-	cmd_type ^= IGC_SET_FLAG(skb->no_fcs, 1, IGC_ADVTXD_DCMD_IFCS);
+	if (skb)
+		cmd_type ^= IGC_SET_FLAG(skb->no_fcs, 1, IGC_ADVTXD_DCMD_IFCS);
 
 	return cmd_type;
 }
@@ -1414,17 +1415,25 @@ static int igc_tso(struct igc_ring *tx_ring,
 	return 1;
 }
 
-static bool igc_request_tx_tstamp(struct igc_adapter *adapter, struct sk_buff *skb, u32 *flags)
+static bool igc_request_tx_tstamp(struct igc_adapter *adapter,
+				  union igc_pending_ts_pkt ts_pkt, u32 *flags,
+				  struct xsk_buff_pool *xsk_pool)
 {
 	int i;
 
 	for (i = 0; i < IGC_MAX_TX_TSTAMP_TIMERS; i++) {
 		struct igc_tx_timestamp_request *tstamp = &adapter->tx_tstamp[i];
 
-		if (tstamp->skb)
+		if (tstamp->pending_ts_pkt.ptr)
 			continue;
 
-		tstamp->skb = skb_get(skb);
+		tstamp->pending_ts_pkt = ts_pkt;
+		if (xsk_pool) {
+			tstamp->xsk_pool = xsk_pool;
+			tstamp->type = IGC_TX_BUFFER_TYPE_XSK;
+		} else {
+			tstamp->type = IGC_TX_BUFFER_TYPE_SKB;
+		}
 		tstamp->start = jiffies;
 		*flags = tstamp->flags;
 
@@ -1469,17 +1478,20 @@ static netdev_tx_t igc_xmit_frame_ring(struct sk_buff *skb,
 
 	if (unlikely(skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP)) {
 		struct igc_adapter *adapter = netdev_priv(tx_ring->netdev);
+		union igc_pending_ts_pkt ts_pkt;
 		unsigned long flags;
 		u32 tstamp_flags;
 
 		spin_lock_irqsave(&adapter->ptp_tx_lock, flags);
 
+		ts_pkt.skb = skb_get(skb);
 		if (adapter->tstamp_config.tx_type == HWTSTAMP_TX_ON &&
-		    igc_request_tx_tstamp(adapter, skb, &tstamp_flags)) {
+		    igc_request_tx_tstamp(adapter, ts_pkt, &tstamp_flags, NULL)) {
 			skb_shinfo(skb)->tx_flags |= SKBTX_IN_PROGRESS;
 			tx_flags |= IGC_TX_FLAGS_TSTAMP | tstamp_flags;
 		} else {
 			adapter->tx_hwtstamp_skipped++;
+			skb_unref(skb);
 		}
 
 		spin_unlock_irqrestore(&adapter->ptp_tx_lock, flags);
@@ -2164,7 +2176,8 @@ static int igc_xdp_init_tx_buffer(struct igc_tx_buffer *buffer,
 
 /* This function requires __netif_tx_lock is held by the caller. */
 static int igc_xdp_init_tx_descriptor(struct igc_ring *ring,
-				      struct xdp_frame *xdpf)
+				      struct xdp_frame *xdpf,
+				      u32 tx_flags)
 {
 	struct igc_tx_buffer *buffer;
 	union igc_adv_tx_desc *desc;
@@ -2192,6 +2205,7 @@ static int igc_xdp_init_tx_descriptor(struct igc_ring *ring,
 	netdev_tx_sent_queue(txring_txq(ring), buffer->bytecount);
 
 	buffer->next_to_watch = desc;
+	buffer->tx_flags = tx_flags;
 
 	ring->next_to_use++;
 	if (ring->next_to_use == ring->count)
@@ -2229,7 +2243,7 @@ static int igc_xdp_xmit_back(struct igc_adapter *adapter, struct xdp_buff *xdp)
 	nq = txring_txq(ring);
 
 	__netif_tx_lock(nq, cpu);
-	res = igc_xdp_init_tx_descriptor(ring, xdpf);
+	res = igc_xdp_init_tx_descriptor(ring, xdpf, 0);
 	__netif_tx_unlock(nq);
 	return res;
 }
@@ -2641,6 +2655,7 @@ static void igc_update_tx_stats(struct igc_q_vector *q_vector,
 
 static void igc_xdp_xmit_zc(struct igc_ring *ring)
 {
+	struct igc_adapter *adapter = netdev_priv(ring->netdev);
 	struct xsk_buff_pool *pool = ring->xsk_pool;
 	struct netdev_queue *nq = txring_txq(ring);
 	union igc_adv_tx_desc *tx_desc = NULL;
@@ -2657,13 +2672,37 @@ static void igc_xdp_xmit_zc(struct igc_ring *ring)
 	budget = igc_desc_unused(ring);
 
 	while (xsk_tx_peek_desc(pool, &xdp_desc) && budget--) {
-		u32 cmd_type, olinfo_status;
+		u32 cmd_type, olinfo_status, tx_flags = 0;
 		struct igc_tx_buffer *bi;
+		unsigned long flags;
 		dma_addr_t dma;
 
-		cmd_type = IGC_ADVTXD_DTYP_DATA | IGC_ADVTXD_DCMD_DEXT |
-			   IGC_ADVTXD_DCMD_IFCS | IGC_TXD_DCMD |
-			   xdp_desc.len;
+		if (adapter->tstamp_config.tx_type == HWTSTAMP_TX_ON &&
+		    adapter->btf_enabled) {
+			union igc_pending_ts_pkt ts_pkt;
+			struct xdp_meta_generic___igc *hints;
+			u32 tstamp_flags;
+
+			/* Ensure there's no garbage on metadata */
+			hints = (struct xdp_meta_generic___igc *)
+				((char *)xsk_buff_raw_get_data(pool, xdp_desc.addr)
+				 - sizeof(*hints));
+			spin_lock_irqsave(&adapter->ptp_tx_lock, flags);
+
+			ts_pkt.xsk_desc = xdp_desc;
+			if (igc_request_tx_tstamp(adapter, ts_pkt, &tstamp_flags, pool)) {
+				tx_flags |= IGC_TX_FLAGS_TSTAMP | tstamp_flags;
+				hints->tx_tstamp = 0;
+			} else {
+				adapter->tx_hwtstamp_skipped++;
+			}
+
+			spin_unlock_irqrestore(&adapter->ptp_tx_lock, flags);
+		} else {
+			igc_clean_btf_id(xsk_buff_raw_get_data(pool, xdp_desc.addr));
+		}
+
+		cmd_type = igc_tx_cmd_type(NULL, tx_flags) | IGC_TXD_DCMD | xdp_desc.len;
 		olinfo_status = xdp_desc.len << IGC_ADVTXD_PAYLEN_SHIFT;
 
 		dma = xsk_buff_raw_get_dma(pool, xdp_desc.addr);
@@ -2681,6 +2720,7 @@ static void igc_xdp_xmit_zc(struct igc_ring *ring)
 		bi->gso_segs = 1;
 		bi->time_stamp = jiffies;
 		bi->next_to_watch = tx_desc;
+		bi->xsk_desc = xdp_desc;
 
 		netdev_tx_sent_queue(txring_txq(ring), xdp_desc.len);
 
@@ -2696,6 +2736,47 @@ static void igc_xdp_xmit_zc(struct igc_ring *ring)
 	}
 
 	__netif_tx_unlock(nq);
+}
+
+static bool igc_xsk_complete_tx_tstamp(struct igc_adapter *adapter,
+				       struct igc_tx_buffer *tx_buffer)
+{
+	unsigned long flags;
+	bool ret = true;
+	int i;
+
+	if (!adapter->btf_enabled)
+		return ret;
+
+	spin_lock_irqsave(&adapter->ptp_tx_lock, flags);
+	for (i = 0; i < IGC_MAX_TX_TSTAMP_TIMERS; i++) {
+		struct igc_tx_timestamp_request *tstamp = &adapter->tx_tstamp[i];
+
+		if (!tstamp->pending_ts_pkt.ptr)
+			continue;
+
+		if (tstamp->type == IGC_TX_BUFFER_TYPE_XSK) {
+			struct xdp_desc xdp_desc = tstamp->pending_ts_pkt.xsk_desc;
+
+			if (xdp_desc.addr == tx_buffer->xsk_desc.addr) {
+				struct xdp_meta_generic___igc *hints;
+				struct xsk_buff_pool *pool;
+
+				pool = tstamp->xsk_pool;
+				hints = (struct xdp_meta_generic___igc *)
+					((char *)xsk_buff_raw_get_data(pool, xdp_desc.addr)
+					 - sizeof(*hints));
+				if (!hints->tx_tstamp) {
+					ret = false;
+					break;
+				}
+				tstamp->pending_ts_pkt.ptr = NULL;
+			}
+		}
+	}
+	spin_unlock_irqrestore(&adapter->ptp_tx_lock, flags);
+
+	return ret;
 }
 
 /**
@@ -2737,15 +2818,10 @@ static bool igc_clean_tx_irq(struct igc_q_vector *q_vector, int napi_budget)
 		if (!(eop_desc->wb.status & cpu_to_le32(IGC_TXD_STAT_DD)))
 			break;
 
-		/* clear next_to_watch to prevent false hangs */
-		tx_buffer->next_to_watch = NULL;
-
-		/* update the statistics for this packet */
-		total_bytes += tx_buffer->bytecount;
-		total_packets += tx_buffer->gso_segs;
-
 		switch (tx_buffer->type) {
 		case IGC_TX_BUFFER_TYPE_XSK:
+			if (!igc_xsk_complete_tx_tstamp(adapter, tx_buffer))
+				goto budget_out;
 			xsk_frames++;
 			break;
 		case IGC_TX_BUFFER_TYPE_XDP:
@@ -2760,6 +2836,13 @@ static bool igc_clean_tx_irq(struct igc_q_vector *q_vector, int napi_budget)
 			netdev_warn_once(tx_ring->netdev, "Unknown Tx buffer type\n");
 			break;
 		}
+
+		/* clear next_to_watch to prevent false hangs */
+		tx_buffer->next_to_watch = NULL;
+
+		/* update the statistics for this packet */
+		total_bytes += tx_buffer->bytecount;
+		total_packets += tx_buffer->gso_segs;
 
 		/* clear last DMA location and unmap remaining buffers */
 		while (tx_desc != eop_desc) {
@@ -2794,6 +2877,7 @@ static bool igc_clean_tx_irq(struct igc_q_vector *q_vector, int napi_budget)
 		budget--;
 	} while (likely(budget));
 
+budget_out:
 	netdev_tx_completed_queue(txring_txq(tx_ring),
 				  total_packets, total_bytes);
 
@@ -5691,6 +5775,7 @@ static int igc_xdp_xmit(struct net_device *dev, int num_frames,
 	int cpu = smp_processor_id();
 	struct netdev_queue *nq;
 	struct igc_ring *ring;
+	u32 tx_flags = 0;
 	int i, drops;
 
 	if (unlikely(test_bit(__IGC_DOWN, &adapter->state)))
@@ -5709,7 +5794,7 @@ static int igc_xdp_xmit(struct net_device *dev, int num_frames,
 		int err;
 		struct xdp_frame *xdpf = frames[i];
 
-		err = igc_xdp_init_tx_descriptor(ring, xdpf);
+		err = igc_xdp_init_tx_descriptor(ring, xdpf, tx_flags);
 		if (err) {
 			xdp_return_frame_rx_napi(xdpf);
 			drops++;

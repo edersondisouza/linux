@@ -15,6 +15,7 @@ static inline bool igc_xdp_is_enabled(struct igc_adapter *adapter)
 }
 
 struct xdp_meta_generic___igc {
+	u64 tx_tstamp;
 	u64 tstamp;
 	u32 btf_id;
 } __packed;

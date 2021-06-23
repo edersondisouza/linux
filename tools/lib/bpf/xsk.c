@@ -119,6 +119,30 @@ int xsk_socket__fd(const struct xsk_socket *xsk)
 	return xsk ? xsk->fd : -EINVAL;
 }
 
+void *xsk_umem__adjust_prod_data(void *umem_data, const struct xsk_umem *umem)
+{
+	return umem_data + umem->config.frame_headroom;
+}
+
+void *xsk_umem__adjust_prod_data_meta(void *umem_data, const struct xsk_umem *umem)
+{
+	if (!umem->config.frame_headroom)
+		return NULL;
+	return umem_data;
+}
+
+void *xsk_umem__adjust_cons_data(void *umem_data, const struct xsk_umem *umem)
+{
+	return umem_data;
+}
+
+void *xsk_umem__adjust_cons_data_meta(void *umem_data, const struct xsk_umem *umem)
+{
+	if (!umem->config.frame_headroom)
+		return NULL;
+	return umem_data - umem->config.frame_headroom;
+}
+
 static bool xsk_page_aligned(void *buffer)
 {
 	unsigned long addr = (unsigned long)buffer;

@@ -248,6 +248,11 @@ static inline __u64 xsk_umem__add_offset_to_addr(__u64 addr)
 LIBBPF_API int xsk_umem__fd(const struct xsk_umem *umem);
 LIBBPF_API int xsk_socket__fd(const struct xsk_socket *xsk);
 
+LIBBPF_API void *xsk_umem__adjust_prod_data(void *umem_data, const struct xsk_umem *umem);
+LIBBPF_API void *xsk_umem__adjust_prod_data_meta(void *umem_data, const struct xsk_umem *umem);
+LIBBPF_API void *xsk_umem__adjust_cons_data(void *umem_data, const struct xsk_umem *umem);
+LIBBPF_API void *xsk_umem__adjust_cons_data_meta(void *umem_data, const struct xsk_umem *umem);
+
 #define XSK_RING_CONS__DEFAULT_NUM_DESCS      2048
 #define XSK_RING_PROD__DEFAULT_NUM_DESCS      2048
 #define XSK_UMEM__DEFAULT_FRAME_SHIFT    12 /* 4096 bytes */

@@ -362,4 +362,8 @@ LIBBPF_0.4.0 {
 		bpf_linker__new;
 		bpf_map__inner_map;
 		bpf_object__set_kversion;
+		xsk_umem__adjust_prod_data;
+		xsk_umem__adjust_prod_data_meta;
+		xsk_umem__adjust_cons_data;
+		xsk_umem__adjust_cons_data_meta;
 } LIBBPF_0.3.0;

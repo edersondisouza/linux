@@ -7,11 +7,13 @@
 #include <libgen.h>
 #include <linux/bpf.h>
 #include <linux/compiler.h>
+#include <linux/ethtool.h>
 #include <linux/if_link.h>
 #include <linux/if_xdp.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <linux/limits.h>
+#include <linux/sockios.h>
 #include <linux/udp.h>
 #include <arpa/inet.h>
 #include <locale.h>
@@ -25,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/capability.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -98,6 +101,7 @@ static bool opt_need_wakeup = true;
 static u32 opt_num_xsks = 1;
 static bool opt_busy_poll;
 static bool opt_reduced_cap;
+static bool opt_metadata;
 
 struct xsk_ring_stats {
 	unsigned long rx_npkts;
@@ -141,6 +145,12 @@ struct xsk_umem_info {
 	struct xsk_ring_cons cq;
 	struct xsk_umem *umem;
 	void *buffer;
+	u32 frame_headroom;
+};
+
+struct xsk_metadata {
+	unsigned long rx_timestamp;
+	unsigned long tx_timestamp;
 };
 
 struct xsk_socket_info {
@@ -151,12 +161,51 @@ struct xsk_socket_info {
 	struct xsk_ring_stats ring_stats;
 	struct xsk_app_stats app_stats;
 	struct xsk_driver_stats drv_stats;
+	struct xsk_metadata metadata;
 	u32 outstanding_tx;
 };
+
+struct xdp_hints {
+	u64 rx_timestamp;
+	u64 tx_timestamp;
+	u32 hash32;
+	u32 extension_id;
+	u64 field_map;
+} __attribute__((packed));
 
 static int num_socks;
 struct xsk_socket_info *xsks[MAX_SOCKS];
 int sock;
+
+static u32 get_xdp_headroom(void)
+{
+	struct ethtool_drvinfo drvinfo = { .cmd = ETHTOOL_GDRVINFO };
+	struct ifreq ifr = {};
+	int fd, err, ret;
+
+	fd = socket(AF_LOCAL, SOCK_DGRAM, 0);
+	if (fd < 0)
+		return 0;
+
+	ifr.ifr_data = (void *)&drvinfo;
+	memcpy(ifr.ifr_name, opt_if, strlen(opt_if) + 1);
+	err = ioctl(fd, SIOCETHTOOL, &ifr);
+
+	if (err) {
+		ret = 0;
+		goto out;
+	}
+
+	ret = drvinfo.xdp_headroom;
+
+out:
+	close(fd);
+	return ret;
+}
+
+static void *pad_hints(void *hints, struct xsk_umem_info *umem) {
+	return hints + (umem->frame_headroom - sizeof(struct xdp_hints));
+}
 
 static unsigned long get_nsecs(void)
 {
@@ -255,6 +304,37 @@ static void dump_app_stats(long dt)
 		xsks[i]->app_stats.prev_tx_wakeup_sendtos = xsks[i]->app_stats.tx_wakeup_sendtos;
 		xsks[i]->app_stats.prev_opt_polls = xsks[i]->app_stats.opt_polls;
 	}
+}
+
+static void save_metadata_tx(void *meta, struct xsk_socket_info *xsk)
+{
+	struct xdp_hints *hints = pad_hints(meta, xsk->umem);
+	if (meta && hints->field_map & XDP_GENERIC_HINTS_TX_TIMESTAMP) {
+		xsk->metadata.tx_timestamp = hints->tx_timestamp;
+	}
+}
+
+static void save_metadata_rx(void *meta, struct xsk_socket_info *xsk)
+{
+	struct xdp_hints *hints = pad_hints(meta, xsk->umem);
+	if (meta && hints->field_map & XDP_GENERIC_HINTS_RX_TIMESTAMP) {
+		xsk->metadata.tx_timestamp = hints->rx_timestamp;
+	}
+
+	/*
+	 * To get something specific for a certain driver, one could do:
+	 * if (hints->field_map & XDP_GENERIC_HINTS_EXTENDED) {
+	 *    if (hints->extension_id == SOME_DRIVER_EXT_ID) {
+	 *        struct some_driver_hints *sd_hints = pad_hints(meta,
+	 *              xsk->umem, sizeof(*sd_hints));
+	 *        (...)
+	 *    } else if (hints->extension_id == SOME_OTHER_DRIVER_EXT_ID) {
+	 *        struct some_other_driver_hints *sod_hints = pad_hints(meta,
+	 *              xsk->umem, sizeof(*sod_hints));
+	 *        (...)
+	 *    }
+	 * }
+	 */
 }
 
 static bool get_interrupt_number(void)
@@ -431,6 +511,12 @@ static void dump_stats(void)
 				printf("%-15s\n", "Error retrieving extra stats");
 			}
 		}
+
+		if (opt_metadata) {
+			printf("Last TX time: %lu\n", xsks[i]->metadata.tx_timestamp);
+			printf("Last RX time: %lu\n", xsks[i]->metadata.rx_timestamp);
+		}
+
 	}
 
 	if (opt_app_stats)
@@ -774,8 +860,10 @@ static void gen_eth_hdr_data(void)
 
 static void gen_eth_frame(struct xsk_umem_info *umem, u64 addr)
 {
-	memcpy(xsk_umem__get_data(umem->buffer, addr), pkt_data,
-	       PKT_SIZE);
+	void *data = xsk_umem__get_data(umem->buffer, addr);
+
+	data = xsk_umem__adjust_prod_data(data, umem->umem);
+	memcpy(data, pkt_data, PKT_SIZE);
 }
 
 static struct xsk_umem_info *xsk_configure_umem(void *buffer, u64 size)
@@ -794,7 +882,7 @@ static struct xsk_umem_info *xsk_configure_umem(void *buffer, u64 size)
 		.fill_size = XSK_RING_PROD__DEFAULT_NUM_DESCS * 2,
 		.comp_size = XSK_RING_CONS__DEFAULT_NUM_DESCS,
 		.frame_size = opt_xsk_frame_size,
-		.frame_headroom = XSK_UMEM__DEFAULT_FRAME_HEADROOM,
+		.frame_headroom = get_xdp_headroom(),
 		.flags = opt_umem_flags
 	};
 	int ret;
@@ -809,6 +897,7 @@ static struct xsk_umem_info *xsk_configure_umem(void *buffer, u64 size)
 		exit_with_error(-ret);
 
 	umem->buffer = buffer;
+	umem->frame_headroom = cfg.frame_headroom;
 	return umem;
 }
 
@@ -899,6 +988,7 @@ static struct option long_options[] = {
 	{"irq-string", no_argument, 0, 'I'},
 	{"busy-poll", no_argument, 0, 'B'},
 	{"reduce-cap", no_argument, 0, 'R'},
+	{"metadata", no_argument, 0, 'D'},
 	{0, 0, 0, 0}
 };
 
@@ -939,6 +1029,7 @@ static void usage(const char *prog)
 		"  -I, --irq-string	Display driver interrupt statistics for interface associated with irq-string.\n"
 		"  -B, --busy-poll      Busy poll.\n"
 		"  -R, --reduce-cap	Use reduced capabilities (cannot be used with -M)\n"
+		"  -D, --metadata	Display latest packet metadata\n"
 		"\n";
 	fprintf(stderr, str, prog, XSK_UMEM__DEFAULT_FRAME_SIZE,
 		opt_batch_size, MIN_PKT_SIZE, MIN_PKT_SIZE,
@@ -954,7 +1045,7 @@ static void parse_command_line(int argc, char **argv)
 	opterr = 0;
 
 	for (;;) {
-		c = getopt_long(argc, argv, "Frtli:q:pSNn:czf:muMd:b:C:s:P:xQaI:BR",
+		c = getopt_long(argc, argv, "Frtli:q:pSNn:czf:muMd:b:C:s:P:xQaI:BRD",
 				long_options, &option_index);
 		if (c == -1)
 			break;
@@ -1058,6 +1149,9 @@ static void parse_command_line(int argc, char **argv)
 			break;
 		case 'R':
 			opt_reduced_cap = true;
+			break;
+		case 'D':
+			opt_metadata = true;
 			break;
 		default:
 			usage(basename(argv[0]));
@@ -1165,6 +1259,13 @@ static inline void complete_tx_only(struct xsk_socket_info *xsk,
 
 	rcvd = xsk_ring_cons__peek(&xsk->umem->cq, batch_size, &idx);
 	if (rcvd > 0) {
+		if (opt_metadata) {
+			const struct xdp_desc *cq_desc = xsk_ring_cons__rx_desc(&xsk->umem->cq,
+					idx);
+			char *pkt = xsk_umem__get_data(xsk->umem->buffer, cq_desc->addr);
+			save_metadata_tx(xsk_umem__adjust_cons_data_meta(pkt, xsk->umem->umem),
+					xsk);
+		}
 		xsk_ring_cons__release(&xsk->umem->cq, rcvd);
 		xsk->outstanding_tx -= rcvd;
 	}
@@ -1203,6 +1304,11 @@ static void rx_drop(struct xsk_socket_info *xsk)
 
 		addr = xsk_umem__add_offset_to_addr(addr);
 		char *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
+
+		if (opt_metadata) {
+			save_metadata_rx(xsk_umem__adjust_cons_data_meta(pkt, xsk->umem->umem),
+					xsk);
+		}
 
 		hex_dump(pkt, len, addr);
 		*xsk_ring_prod__fill_addr(&xsk->umem->fq, idx_fq++) = orig;
@@ -1255,7 +1361,9 @@ static void tx_only(struct xsk_socket_info *xsk, u32 *frame_nb, int batch_size)
 	for (i = 0; i < batch_size; i++) {
 		struct xdp_desc *tx_desc = xsk_ring_prod__tx_desc(&xsk->tx,
 								  idx + i);
-		tx_desc->addr = (*frame_nb + i) << XSK_UMEM__DEFAULT_FRAME_SHIFT;
+		tx_desc->addr = (__u64)xsk_umem__adjust_prod_data(
+				(void *)(__u64)((*frame_nb + i) << XSK_UMEM__DEFAULT_FRAME_SHIFT),
+				xsk->umem->umem);
 		tx_desc->len = PKT_SIZE;
 	}
 

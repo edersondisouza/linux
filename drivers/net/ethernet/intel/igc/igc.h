@@ -241,6 +241,7 @@ struct igc_adapter {
 
 	struct btf *btf;
 	u8 btf_enabled;
+	struct xdp_desc ptp_tx_xsk_desc;
 };
 
 void igc_up(struct igc_adapter *adapter);
@@ -432,6 +433,7 @@ struct igc_tx_buffer {
 	union {
 		struct sk_buff *skb;
 		struct xdp_frame *xdpf;
+		struct xdp_desc zc_xdpd;
 	};
 	unsigned int bytecount;
 	u16 gso_segs;
@@ -599,6 +601,7 @@ int igc_ptp_set_ts_config(struct net_device *netdev, struct ifreq *ifr);
 int igc_ptp_get_ts_config(struct net_device *netdev, struct ifreq *ifr);
 void igc_ptp_tx_hang(struct igc_adapter *adapter);
 void igc_ptp_read(struct igc_adapter *adapter, struct timespec64 *ts);
+ktime_t igc_retrieve_ptp_tx_timestamp(struct igc_adapter *adapter);
 
 #define igc_rx_pg_size(_ring) (PAGE_SIZE << igc_rx_pg_order(_ring))
 

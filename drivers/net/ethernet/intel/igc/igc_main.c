@@ -2073,7 +2073,8 @@ static int igc_xdp_init_tx_buffer(struct igc_tx_buffer *buffer,
 
 /* This function requires __netif_tx_lock is held by the caller. */
 static int igc_xdp_init_tx_descriptor(struct igc_ring *ring,
-				      struct xdp_frame *xdpf)
+				      struct xdp_frame *xdpf,
+				      u32 tx_flags)
 {
 	struct igc_tx_buffer *buffer;
 	union igc_adv_tx_desc *desc;
@@ -2101,6 +2102,7 @@ static int igc_xdp_init_tx_descriptor(struct igc_ring *ring,
 	netdev_tx_sent_queue(txring_txq(ring), buffer->bytecount);
 
 	buffer->next_to_watch = desc;
+	buffer->tx_flags = tx_flags;
 
 	ring->next_to_use++;
 	if (ring->next_to_use == ring->count)
@@ -2138,7 +2140,7 @@ static int igc_xdp_xmit_back(struct igc_adapter *adapter, struct xdp_buff *xdp)
 	nq = txring_txq(ring);
 
 	__netif_tx_lock(nq, cpu);
-	res = igc_xdp_init_tx_descriptor(ring, xdpf);
+	res = igc_xdp_init_tx_descriptor(ring, xdpf, 0);
 	__netif_tx_unlock(nq);
 	return res;
 }
@@ -2539,6 +2541,7 @@ static void igc_update_tx_stats(struct igc_q_vector *q_vector,
 
 static void igc_xdp_xmit_zc(struct igc_ring *ring)
 {
+	struct igc_adapter *adapter = netdev_priv(ring->netdev);
 	struct xsk_buff_pool *pool = ring->xsk_pool;
 	struct netdev_queue *nq = txring_txq(ring);
 	union igc_adv_tx_desc *tx_desc = NULL;
@@ -2559,7 +2562,18 @@ static void igc_xdp_xmit_zc(struct igc_ring *ring)
 		struct igc_tx_buffer *bi;
 		dma_addr_t dma;
 
-		cmd_type = IGC_ADVTXD_DTYP_DATA | IGC_ADVTXD_DCMD_DEXT |
+		cmd_type = 0;
+		if (adapter->tstamp_config.tx_type == HWTSTAMP_TX_ON &&
+			adapter->btf_enabled &&
+			!test_and_set_bit_lock(__IGC_PTP_TX_IN_PROGRESS,
+					   &adapter->state)) {
+			adapter->ptp_tx_xsk_desc = xdp_desc;
+			cmd_type = IGC_ADVTXD_MAC_TSTAMP;
+		} else {
+			adapter->tx_hwtstamp_skipped++;
+		}
+
+		cmd_type |= IGC_ADVTXD_DTYP_DATA | IGC_ADVTXD_DCMD_DEXT |
 			   IGC_ADVTXD_DCMD_IFCS | IGC_TXD_DCMD |
 			   xdp_desc.len;
 		olinfo_status = xdp_desc.len << IGC_ADVTXD_PAYLEN_SHIFT;
@@ -2579,6 +2593,7 @@ static void igc_xdp_xmit_zc(struct igc_ring *ring)
 		bi->gso_segs = 1;
 		bi->time_stamp = jiffies;
 		bi->next_to_watch = tx_desc;
+		bi->zc_xdpd = xdp_desc;
 
 		netdev_tx_sent_queue(txring_txq(ring), xdp_desc.len);
 
@@ -2594,6 +2609,40 @@ static void igc_xdp_xmit_zc(struct igc_ring *ring)
 	}
 
 	__netif_tx_unlock(nq);
+}
+
+static void igc_xsk_update_tx_metadata(struct igc_adapter *adapter,
+		struct igc_ring *ring, struct igc_tx_buffer *tx_buffer)
+{
+	struct xdp_hints___igc *hints;
+	ktime_t timestamp;
+	struct xdp_desc xdp_desc, empty_xdp_desc = {};
+	struct xsk_buff_pool *pool = ring->xsk_pool;
+	struct igc_hw *hw = &adapter->hw;
+	u32 tsynctxctl;
+
+	xdp_desc = tx_buffer->zc_xdpd;
+
+	if (!adapter->btf_enabled || adapter->ptp_tx_xsk_desc.len == 0
+			|| adapter->ptp_tx_xsk_desc.addr != xdp_desc.addr)
+		return;
+
+	if (!test_bit(__IGC_PTP_TX_IN_PROGRESS, &adapter->state))
+		return;
+
+	if (WARN_ON_ONCE(pool->headroom < sizeof(struct xdp_hints___igc)))
+		return;
+
+	tsynctxctl = rd32(IGC_TSYNCTXCTL);
+	if (!(tsynctxctl & IGC_TSYNCTXCTL_TXTT_0))
+		return;
+	timestamp = igc_retrieve_ptp_tx_timestamp(adapter);
+
+	hints = (struct xdp_hints___igc *) ((char *) xsk_buff_raw_get_data(pool, xdp_desc.addr) - sizeof(*hints));
+	hints->tx_timestamp = timestamp;
+	hints->field_map = XDP_GENERIC_HINTS_TX_TIMESTAMP;
+	adapter->ptp_tx_xsk_desc = empty_xdp_desc;
+	clear_bit_unlock(__IGC_PTP_TX_IN_PROGRESS, &adapter->state);
 }
 
 /**
@@ -2644,6 +2693,7 @@ static bool igc_clean_tx_irq(struct igc_q_vector *q_vector, int napi_budget)
 
 		switch (tx_buffer->type) {
 		case IGC_TX_BUFFER_TYPE_XSK:
+			igc_xsk_update_tx_metadata(adapter, tx_ring, tx_buffer);
 			xsk_frames++;
 			break;
 		case IGC_TX_BUFFER_TYPE_XDP:
@@ -5573,6 +5623,7 @@ static int igc_xdp_xmit(struct net_device *dev, int num_frames,
 	int cpu = smp_processor_id();
 	struct netdev_queue *nq;
 	struct igc_ring *ring;
+	u32 tx_flags = 0;
 	int i, drops;
 
 	if (unlikely(test_bit(__IGC_DOWN, &adapter->state)))
@@ -5591,7 +5642,7 @@ static int igc_xdp_xmit(struct net_device *dev, int num_frames,
 		int err;
 		struct xdp_frame *xdpf = frames[i];
 
-		err = igc_xdp_init_tx_descriptor(ring, xdpf);
+		err = igc_xdp_init_tx_descriptor(ring, xdpf, tx_flags);
 		if (err) {
 			xdp_return_frame_rx_napi(xdpf);
 			drops++;

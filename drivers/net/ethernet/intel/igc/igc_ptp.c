@@ -629,24 +629,12 @@ void igc_ptp_tx_hang(struct igc_adapter *adapter)
 	}
 }
 
-/**
- * igc_ptp_tx_hwtstamp - utility function which checks for TX time stamp
- * @adapter: Board private structure
- *
- * If we were asked to do hardware stamping and such a time stamp is
- * available, then it must have been for this skb here because we only
- * allow only one such packet into the queue.
- */
-static void igc_ptp_tx_hwtstamp(struct igc_adapter *adapter)
+ktime_t igc_retrieve_ptp_tx_timestamp(struct igc_adapter *adapter)
 {
-	struct sk_buff *skb = adapter->ptp_tx_skb;
 	struct skb_shared_hwtstamps shhwtstamps;
 	struct igc_hw *hw = &adapter->hw;
 	int adjust = 0;
 	u64 regval;
-
-	if (WARN_ON_ONCE(!skb))
-		return;
 
 	regval = rd32(IGC_TXSTMPL);
 	regval |= (u64)rd32(IGC_TXSTMPH) << 32;
@@ -670,17 +658,41 @@ static void igc_ptp_tx_hwtstamp(struct igc_adapter *adapter)
 	shhwtstamps.hwtstamp =
 		ktime_add_ns(shhwtstamps.hwtstamp, adjust);
 
-	/* Clear the lock early before calling skb_tstamp_tx so that
-	 * applications are not woken up before the lock bit is clear. We use
-	 * a copy of the skb pointer to ensure other threads can't change it
-	 * while we're notifying the stack.
-	 */
-	adapter->ptp_tx_skb = NULL;
-	clear_bit_unlock(__IGC_PTP_TX_IN_PROGRESS, &adapter->state);
+	return shhwtstamps.hwtstamp;
+}
 
-	/* Notify the stack and free the skb after we've unlocked */
-	skb_tstamp_tx(skb, &shhwtstamps);
-	dev_kfree_skb_any(skb);
+/**
+ * igc_ptp_tx_hwtstamp - utility function which checks for TX time stamp
+ * @adapter: Board private structure
+ *
+ * If we were asked to do hardware stamping and such a time stamp is
+ * available, then it must have been for this skb here because we only
+ * allow only one such packet into the queue.
+ */
+static void igc_ptp_tx_hwtstamp(struct igc_adapter *adapter)
+{
+	struct sk_buff *skb = adapter->ptp_tx_skb;
+	struct xdp_desc xdp_desc = adapter->ptp_tx_xsk_desc;
+	struct skb_shared_hwtstamps shhwtstamps;
+
+	if (WARN_ON_ONCE(!skb && !xdp_desc.len))
+		return;
+
+	if (skb) {
+		shhwtstamps.hwtstamp = igc_retrieve_ptp_tx_timestamp(adapter);
+
+		/* Clear the lock early before calling skb_tstamp_tx so that
+		 * applications are not woken up before the lock bit is clear. We use
+		 * a copy of the skb pointer to ensure other threads can't change it
+		 * while we're notifying the stack.
+		 */
+		adapter->ptp_tx_skb = NULL;
+		clear_bit_unlock(__IGC_PTP_TX_IN_PROGRESS, &adapter->state);
+
+		/* Notify the stack and free the skb after we've unlocked */
+		skb_tstamp_tx(skb, &shhwtstamps);
+		dev_kfree_skb_any(skb);
+	}
 }
 
 /**

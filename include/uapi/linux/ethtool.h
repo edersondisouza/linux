@@ -176,6 +176,8 @@ static inline __u32 ethtool_cmd_speed(const struct ethtool_cmd *ep)
  *	and %ETHTOOL_SEEPROM commands, in bytes
  * @regdump_len: Size of register dump returned by the %ETHTOOL_GREGS
  *	command, in bytes
+ * @xdp_headroom: Size of minimum XDP headroom needed by the driver
+ *	to fill with metadata information.
  *
  * Users can use the %ETHTOOL_GSSET_INFO command to get the number of
  * strings in any string set (from Linux 2.6.34).
@@ -197,6 +199,7 @@ struct ethtool_drvinfo {
 	__u32	testinfo_len;
 	__u32	eedump_len;
 	__u32	regdump_len;
+	__u32	xdp_headroom;
 };
 
 #define SOPASS_MAX	6

@@ -31,6 +31,7 @@
 #include <linux/if_link.h>
 
 #include "bpf.h"
+#include "hashmap.h"
 #include "libbpf.h"
 #include "libbpf_internal.h"
 #include "xsk.h"
@@ -141,6 +142,14 @@ void *xsk_umem__adjust_cons_data_meta(void *umem_data, const struct xsk_umem *um
 	if (!umem->config.xdp_headroom)
 		return NULL;
 	return umem_data;
+}
+
+int xsk_umem__btf_id(void *umem_data, const struct xsk_umem *umem)
+{
+	if (umem->config.xdp_headroom < sizeof(int))
+		return -EINVAL;
+
+	return *(int *)(umem_data - sizeof(int));
 }
 
 static bool xsk_page_aligned(void *buffer)
@@ -1289,4 +1298,221 @@ void xsk_socket__delete(struct xsk_socket *xsk)
 	if (xsk->fd != umem->fd)
 		close(xsk->fd);
 	free(xsk);
+}
+
+struct xsk_btf_info {
+	struct hashmap map;
+	struct btf *base;
+	struct btf *btf;
+	const struct btf_type *type;
+};
+
+struct xsk_btf_entry {
+	__u32 offset;
+	__u32 size;
+};
+
+static void __xsk_btf_free_hash(struct xsk_btf_info *xbi)
+{
+	struct hashmap_entry *entry;
+	int i;
+
+	hashmap__for_each_entry((&(xbi->map)), entry, i) {
+		free(entry->value);
+	}
+	hashmap__clear(&(xbi->map));
+}
+
+static size_t __xsk_hash_fn(const void *key, void *ctx)
+{
+	return (size_t)key;
+}
+
+static bool __xsk_equal_fn(const void *k1, const void *k2, void *ctx)
+{
+	return k1 == k2;
+}
+
+static bool __xsk_btf_match_md_name(const char *name)
+{
+	const char *md_name = "xdp_meta_generic";
+	size_t s1, s2;
+
+	s1 = strlen(name);
+	s2 = strlen(md_name);
+
+	if (s1 < s2)
+		return false;
+
+	if (!strcmp(name, md_name))
+		return true;
+
+	if (s1 > (s2 + 3)) {
+		return !strncmp(name, md_name, s2)
+			&& name[s2] == '_'
+			&& name[s2 + 1] == '_'
+			&& name[s2 + 2] == '_';
+	}
+
+	return false;
+}
+
+static const struct btf_type *__xsk_btf_find_md_btf(struct btf *btf)
+{
+	const struct btf_type *t;
+	const char *name;
+	__u32 nr_types;
+	int i;
+
+	nr_types = btf__get_nr_types(btf);
+	/* 0th type is void, we must ignore it */
+	for (i = 1; i < nr_types; i++) {
+		t = btf__type_by_id(btf, i);
+		name = btf__name_by_offset(btf, t->name_off);
+		if (name && __xsk_btf_match_md_name(name))
+			return t;
+	}
+
+	return NULL;
+}
+
+int xsk_btf__init(__u32 btf_id, struct xsk_btf_info **xbi)
+{
+	const struct btf_member *m;
+	const struct btf_type *t;
+	struct btf *btf, *base;
+	unsigned short vlen;
+	int i, ret = 0;
+
+	if (!xbi)
+		return -EINVAL;
+
+	base = btf__parse("/sys/kernel/btf/vmlinux", NULL);
+	if (!base)
+		return -ENOENT;
+
+	btf = btf__load_from_kernel_by_id_split(btf_id, base);
+	ret = libbpf_get_error(btf);
+	if (ret)
+		goto error_load;
+
+	t = __xsk_btf_find_md_btf(btf);
+	if (!t) {
+		ret = -ENOENT;
+		goto error_btf;
+	}
+
+	*xbi = malloc(sizeof(**xbi));
+	if (!*xbi) {
+		ret = -ENOMEM;
+		goto error_btf;
+	}
+
+	hashmap__init(&(*xbi)->map, __xsk_hash_fn, __xsk_equal_fn, NULL);
+
+	/* Validate no BTF field is a bitfield */
+	m = btf_members(t);
+	vlen = BTF_INFO_VLEN(t->info);
+	for (i = 0; i < vlen; i++, m++) {
+		if (BTF_MEMBER_BITFIELD_SIZE(m->offset)) {
+			ret = -ENOTSUP;
+			goto error_entry;
+		}
+	}
+
+	(*xbi)->base = base;
+	(*xbi)->btf = btf;
+	(*xbi)->type = t;
+
+	return ret;
+
+error_entry:
+	__xsk_btf_free_hash(*xbi);
+	free(*xbi);
+
+error_btf:
+	btf__free(btf);
+
+error_load:
+	btf__free(base);
+	return ret;
+}
+
+static int __xsk_btf_field_entry(struct xsk_btf_info *xbi, const char *field,
+			  struct xsk_btf_entry **entry)
+{
+	const struct btf_member *m;
+	unsigned short vlen;
+	int i;
+
+	m = btf_members(xbi->type);
+	vlen = BTF_INFO_VLEN(xbi->type->info);
+	for (i = 0; i < vlen; i++, m++) {
+		const struct btf_type *member_type;
+		const char *name = btf__name_by_offset(xbi->btf, m->name_off);
+		int type_id;
+
+		if (strcmp(name, field))
+			continue;
+
+		if (entry) {
+			type_id = btf__resolve_type(xbi->btf, m->type);
+			member_type = btf__type_by_id(xbi->btf, type_id);
+			*entry = malloc(sizeof(*entry));
+			if (!entry)
+				return -ENOMEM;
+
+			/* As we bail out at init for bit fields, there should
+			 * be no entries whose offset is not a multiple of byte
+			 */
+			(*entry)->offset = BTF_MEMBER_BIT_OFFSET(m->offset) / 8;
+			(*entry)->size = member_type->size;
+		}
+		return 0;
+	}
+
+	return -ENOENT;
+}
+
+bool xsk_btf__has_field(const char *field, struct xsk_btf_info *xbi)
+{
+	if (!xbi)
+		return false;
+
+	return __xsk_btf_field_entry(xbi, field, NULL);
+}
+
+void xsk_btf__free(struct xsk_btf_info *xbi)
+{
+	if (!xbi)
+		return;
+
+	__xsk_btf_free_hash(xbi);
+	btf__free(xbi->btf);
+	btf__free(xbi->base);
+	free(xbi);
+}
+
+int xsk_btf__read(void **dest, size_t size, const char *field, struct xsk_btf_info *xbi,
+		  const void *addr)
+{
+	struct xsk_btf_entry *entry;
+	int err;
+
+	if (!field || !xbi || !dest || !addr)
+		return -EINVAL;
+
+	if (!hashmap__find(&(xbi->map), field, (void **)&entry)) {
+		err = __xsk_btf_field_entry(xbi, field, &entry);
+		if (err)
+			return err;
+
+		hashmap__add(&(xbi->map), field, entry);
+	}
+
+	if (entry->size != size)
+		return -EINVAL;
+
+	*dest = (void *)((char *)addr - xbi->type->size + entry->offset);
+	return 0;
 }

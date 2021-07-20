@@ -253,6 +253,8 @@ LIBBPF_API void *xsk_umem__adjust_prod_data_meta(void *umem_data, const struct x
 LIBBPF_API void *xsk_umem__adjust_cons_data(void *umem_data, const struct xsk_umem *umem);
 LIBBPF_API void *xsk_umem__adjust_cons_data_meta(void *umem_data, const struct xsk_umem *umem);
 
+LIBBPF_API int xsk_umem__btf_id(void *umem_data, const struct xsk_umem *umem);
+
 #define XSK_RING_CONS__DEFAULT_NUM_DESCS      2048
 #define XSK_RING_PROD__DEFAULT_NUM_DESCS      2048
 #define XSK_UMEM__DEFAULT_FRAME_SHIFT    12 /* 4096 bytes */
@@ -321,6 +323,19 @@ xsk_socket__create_shared(struct xsk_socket **xsk_ptr,
 /* Returns 0 for success and -EBUSY if the umem is still in use. */
 LIBBPF_API int xsk_umem__delete(struct xsk_umem *umem);
 LIBBPF_API void xsk_socket__delete(struct xsk_socket *xsk);
+
+struct xsk_btf_info;
+
+LIBBPF_API int xsk_btf__init(__u32 btf_id, struct xsk_btf_info **xbi);
+LIBBPF_API int xsk_btf__read(void **dest, size_t size, const char *field, struct xsk_btf_info *xbi,
+			     const void *addr);
+LIBBPF_API bool xsk_btf__has_field(const char *field, struct xsk_btf_info *xbi);
+LIBBPF_API void xsk_btf__free(struct xsk_btf_info *xbi);
+
+#define XSK_BTF_READ_INTO(dest, field, xbi, addr) ({ \
+	typeof(dest) *_d; \
+	xsk_btf__read((void **)&_d, sizeof(dest), #field, xbi, addr); \
+	dest = *_d; })
 
 #ifdef __cplusplus
 } /* extern "C" */

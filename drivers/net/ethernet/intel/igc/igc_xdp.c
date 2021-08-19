@@ -7,7 +7,7 @@
 #include "igc_xdp.h"
 
 int igc_xdp_set_prog(struct igc_adapter *adapter, struct bpf_prog *prog,
-		     struct netlink_ext_ack *extack)
+		     struct netlink_ext_ack *extack, u32 flags)
 {
 	struct net_device *dev = adapter->netdev;
 	bool if_running = netif_running(dev);
@@ -23,6 +23,8 @@ int igc_xdp_set_prog(struct igc_adapter *adapter, struct bpf_prog *prog,
 
 	if (if_running)
 		igc_close(dev);
+
+	adapter->btf_enabled = flags & XDP_FLAGS_USE_METADATA;
 
 	old_prog = xchg(&adapter->xdp_prog, prog);
 	if (old_prog)

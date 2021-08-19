@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Copyright (c)  2018 Intel Corporation */
 
+#include <linux/bpf.h>
+#include <linux/btf.h>
 #include <linux/module.h>
 #include <linux/types.h>
 #include <linux/if_vlan.h>
@@ -2311,6 +2313,14 @@ static void igc_finalize_xdp(struct igc_adapter *adapter, int status)
 		xdp_do_flush();
 }
 
+void igc_clean_btf_id(void *addr)
+{
+	struct xdp_meta_generic___igc *hints;
+
+	hints = addr - sizeof(*hints);
+	hints->btf_id = 0;
+}
+
 static void igc_update_rx_stats(struct igc_q_vector *q_vector,
 				unsigned int packets, unsigned int bytes)
 {
@@ -2374,8 +2384,21 @@ static int igc_clean_rx_irq(struct igc_q_vector *q_vector, const int budget)
 
 		if (!skb) {
 			xdp_init_buff(&xdp, truesize, &rx_ring->xdp_rxq);
+
 			xdp_prepare_buff(&xdp, pktbuf - igc_rx_offset(rx_ring),
-					 igc_rx_offset(rx_ring) + pkt_offset, size, false);
+					 igc_rx_offset(rx_ring) + pkt_offset, size,
+					 adapter->btf_enabled);
+
+			if (adapter->btf_enabled) {
+				struct xdp_meta_generic___igc *hints;
+
+				hints = xdp.data - sizeof(*hints);
+				xdp.data_meta = hints;
+				hints->tstamp = timestamp;
+				hints->btf_id = adapter->btf_id;
+			} else {
+				igc_clean_btf_id(xdp.data);
+			}
 
 			skb = igc_xdp_run_prog(adapter, &xdp);
 		}
@@ -2539,12 +2562,19 @@ static int igc_clean_rx_irq_zc(struct igc_q_vector *q_vector, const int budget)
 							bi->xdp->data);
 
 			bi->xdp->data += IGC_TS_HDR_LEN;
-
-			/* HW timestamp has been copied into local variable. Metadata
-			 * length when XDP program is called should be 0.
-			 */
 			bi->xdp->data_meta += IGC_TS_HDR_LEN;
 			size -= IGC_TS_HDR_LEN;
+
+			if (adapter->btf_enabled) {
+				struct xdp_meta_generic___igc *hints;
+
+				hints = bi->xdp->data - sizeof(*hints);
+				bi->xdp->data_meta = hints;
+				hints->tstamp = timestamp;
+				hints->btf_id = adapter->btf_id;
+			} else {
+				igc_clean_btf_id(bi->xdp->data);
+			}
 		}
 
 		bi->xdp->data_end = bi->xdp->data + size;
@@ -4206,6 +4236,19 @@ err_alloc_q_vectors:
 	return err;
 }
 
+static void igc_btf_init(struct igc_adapter *adapter)
+{
+	struct module *owner = THIS_MODULE;
+	struct btf *btf;
+
+	if (owner)
+		btf = btf_get_from_module(owner);
+	else
+		btf = bpf_get_btf_vmlinux();
+
+	adapter->btf_id = btf_obj_id(btf);
+}
+
 /**
  * igc_sw_init - Initialize general software structures (struct igc_adapter)
  * @adapter: board private structure to initialize
@@ -4258,6 +4301,8 @@ static int igc_sw_init(struct igc_adapter *adapter)
 	igc_irq_disable(adapter);
 
 	set_bit(__IGC_DOWN, &adapter->state);
+
+	igc_btf_init(adapter);
 
 	return 0;
 }
@@ -5630,7 +5675,7 @@ static int igc_bpf(struct net_device *dev, struct netdev_bpf *bpf)
 
 	switch (bpf->command) {
 	case XDP_SETUP_PROG:
-		return igc_xdp_set_prog(adapter, bpf->prog, bpf->extack);
+		return igc_xdp_set_prog(adapter, bpf->prog, bpf->extack, bpf->flags);
 	case XDP_SETUP_XSK_POOL:
 		return igc_xdp_setup_pool(adapter, bpf->xsk.pool,
 					  bpf->xsk.queue_id);

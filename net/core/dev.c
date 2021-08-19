@@ -9475,7 +9475,7 @@ static int dev_xdp_attach(struct net_device *dev, struct netlink_ext_ack *extack
 	if (link && (new_prog || old_prog))
 		return -EINVAL;
 	/* link supports only XDP mode flags */
-	if (link && (flags & ~XDP_FLAGS_MODES)) {
+	if (link && (flags & ~(XDP_FLAGS_MODES | XDP_FLAGS_USE_METADATA))) {
 		NL_SET_ERR_MSG(extack, "Invalid XDP flags for BPF link attachment");
 		return -EINVAL;
 	}

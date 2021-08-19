@@ -6077,6 +6077,28 @@ static int __init btf_module_init(void)
 fs_initcall(btf_module_init);
 #endif /* CONFIG_DEBUG_INFO_BTF_MODULES */
 
+struct btf *btf_get_from_module(const struct module *module)
+{
+	struct btf *res = NULL;
+#ifdef CONFIG_DEBUG_INFO_BTF_MODULES
+	struct btf_module *btf_mod, *tmp;
+
+	mutex_lock(&btf_module_mutex);
+	list_for_each_entry_safe(btf_mod, tmp, &btf_modules, list) {
+		if (btf_mod->module != module)
+			continue;
+
+		res = btf_mod->btf;
+
+		break;
+	}
+	mutex_unlock(&btf_module_mutex);
+#endif
+
+	return res;
+}
+EXPORT_SYMBOL_GPL(btf_get_from_module);
+
 struct module *btf_try_get_module(const struct btf *btf)
 {
 	struct module *res = NULL;

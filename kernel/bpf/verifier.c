@@ -13313,6 +13313,7 @@ struct btf *bpf_get_btf_vmlinux(void)
 	}
 	return btf_vmlinux;
 }
+EXPORT_SYMBOL_GPL(bpf_get_btf_vmlinux);
 
 int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr)
 {

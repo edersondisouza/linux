@@ -718,13 +718,13 @@ again:
 			dev_kfree_skb_any(tstamp->pending_ts_pkt.skb);
 			tstamp->pending_ts_pkt.ptr = NULL;
 		} else if (tstamp->type == IGC_TX_BUFFER_TYPE_XSK) {
-			struct xdp_meta_generic___igc *hints;
+			struct xdp_meta_generic *hints;
 			struct xsk_buff_pool *pool;
 			struct xdp_desc xdp_desc;
 
 			pool = tstamp->xsk_pool;
 			xdp_desc = tstamp->pending_ts_pkt.xsk_desc;
-			hints = (struct xdp_meta_generic___igc *)
+			hints = (struct xdp_meta_generic *)
 				((char *)xsk_buff_raw_get_data(pool, xdp_desc.addr)
 				 - sizeof(*hints));
 			hints->tx_tstamp = shhwtstamps.hwtstamp;

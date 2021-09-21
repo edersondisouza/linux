@@ -1378,11 +1378,9 @@ static const struct btf_type *__xsk_btf_find_md_btf(struct btf *btf)
 
 int xsk_btf__init(__u32 btf_id, struct xsk_btf_info **xbi)
 {
-	const struct btf_member *m;
 	const struct btf_type *t;
 	struct btf *btf, *base;
-	unsigned short vlen;
-	int i, ret = 0;
+	int ret = 0;
 
 	if (!xbi)
 		return -EINVAL;
@@ -1410,25 +1408,11 @@ int xsk_btf__init(__u32 btf_id, struct xsk_btf_info **xbi)
 
 	hashmap__init(&(*xbi)->map, __xsk_hash_fn, __xsk_equal_fn, NULL);
 
-	/* Validate no BTF field is a bitfield */
-	m = btf_members(t);
-	vlen = BTF_INFO_VLEN(t->info);
-	for (i = 0; i < vlen; i++, m++) {
-		if (BTF_MEMBER_BITFIELD_SIZE(m->offset)) {
-			ret = -ENOTSUP;
-			goto error_entry;
-		}
-	}
-
 	(*xbi)->base = base;
 	(*xbi)->btf = btf;
 	(*xbi)->type = t;
 
 	return ret;
-
-error_entry:
-	__xsk_btf_free_hash(*xbi);
-	free(*xbi);
 
 error_btf:
 	btf__free(btf);
@@ -1438,28 +1422,42 @@ error_load:
 	return ret;
 }
 
-static int __xsk_btf_field_entry(struct xsk_btf_info *xbi, const char *field,
-			  struct xsk_btf_entry **entry)
+static int __xsk_btf_field_find_entry(struct xsk_btf_info *xbi, const char *field,
+			  struct xsk_btf_entry **entry, const struct btf_type *type)
 {
 	const struct btf_member *m;
 	unsigned short vlen;
-	int i;
+	int i, ret;
 
-	m = btf_members(xbi->type);
-	vlen = BTF_INFO_VLEN(xbi->type->info);
+	m = btf_members(type);
+	vlen = BTF_INFO_VLEN(type->info);
 	for (i = 0; i < vlen; i++, m++) {
 		const struct btf_type *member_type;
 		const char *name = btf__name_by_offset(xbi->btf, m->name_off);
-		int type_id;
+		int type_id, kind;
+
+		type_id = btf__resolve_type(xbi->btf, m->type);
+		member_type = btf__type_by_id(xbi->btf, type_id);
+
+		kind = BTF_INFO_KIND(member_type->info);
+		if (kind == BTF_KIND_UNION || kind == BTF_KIND_STRUCT) {
+			ret = __xsk_btf_field_find_entry(xbi, field, entry, member_type);
+			if (ret == -ENOENT)
+				continue;
+			return ret;
+		}
 
 		if (strcmp(name, field))
 			continue;
 
 		if (entry) {
-			type_id = btf__resolve_type(xbi->btf, m->type);
-			member_type = btf__type_by_id(xbi->btf, type_id);
+			if (BTF_MEMBER_BITFIELD_SIZE(m->offset)) {
+				/* No support for bit fields for now */
+				return -EOPNOTSUPP;
+			}
+
 			*entry = malloc(sizeof(*entry));
-			if (!entry)
+			if (!*entry)
 				return -ENOMEM;
 
 			/* As we bail out at init for bit fields, there should
@@ -1472,6 +1470,12 @@ static int __xsk_btf_field_entry(struct xsk_btf_info *xbi, const char *field,
 	}
 
 	return -ENOENT;
+}
+
+static int __xsk_btf_field_entry(struct xsk_btf_info *xbi, const char *field,
+			  struct xsk_btf_entry **entry)
+{
+	return __xsk_btf_field_find_entry(xbi, field, entry, xbi->type);
 }
 
 bool xsk_btf__has_field(const char *field, struct xsk_btf_info *xbi)

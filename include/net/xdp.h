@@ -77,19 +77,26 @@ struct xdp_buff {
 };
 
 struct xdp_meta_generic {
-	// Tx part
-	u32        flags;
-	u16        free_slot;
-	u16        csum_off;
-	u16        txcvid;
+	union {
+		// Tx part
+		struct {
+			u16        free_slot;
+			u16        csum_off;
+			u16        txcvid;
+			u32        flags;
+			u64        tx_tstamp;
+		};
 
-	// Rx part
-	u16        rxcvid;
-	u32        csum;
-	u32        hash;
-	u64        tstamp;
-
+		// Rx part
+		struct {
+			u16        rxcvid;
+			u32        csum;
+			u32        hash;
+			u64        tstamp;
+		};
+	};
 	// BTF ID
+	u32        pad;
 	u32        btf_id;
 } __packed __aligned(8);
 static_assert(sizeof(struct xdp_meta_generic) == 32);

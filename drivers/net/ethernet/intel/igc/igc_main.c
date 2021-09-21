@@ -2329,7 +2329,7 @@ static void igc_finalize_xdp(struct igc_adapter *adapter, int status)
 
 void igc_clean_btf_id(void *addr)
 {
-	struct xdp_meta_generic___igc *hints;
+	struct xdp_meta_generic *hints;
 
 	hints = addr - sizeof(*hints);
 	hints->btf_id = 0;
@@ -2404,10 +2404,11 @@ static int igc_clean_rx_irq(struct igc_q_vector *q_vector, const int budget)
 					 adapter->btf_enabled);
 
 			if (adapter->btf_enabled) {
-				struct xdp_meta_generic___igc *hints;
+				struct xdp_meta_generic *hints;
 
 				hints = xdp.data - sizeof(*hints);
 				xdp.data_meta = hints;
+				hints->tx_tstamp = -1;
 				hints->tstamp = timestamp;
 				hints->btf_id = adapter->btf_id;
 			} else {
@@ -2580,7 +2581,7 @@ static int igc_clean_rx_irq_zc(struct igc_q_vector *q_vector, const int budget)
 			size -= IGC_TS_HDR_LEN;
 
 			if (adapter->btf_enabled) {
-				struct xdp_meta_generic___igc *hints;
+				struct xdp_meta_generic *hints;
 
 				hints = bi->xdp->data - sizeof(*hints);
 				bi->xdp->data_meta = hints;
@@ -2680,11 +2681,11 @@ static void igc_xdp_xmit_zc(struct igc_ring *ring)
 		if (adapter->tstamp_config.tx_type == HWTSTAMP_TX_ON &&
 		    adapter->btf_enabled) {
 			union igc_pending_ts_pkt ts_pkt;
-			struct xdp_meta_generic___igc *hints;
+			struct xdp_meta_generic *hints;
 			u32 tstamp_flags;
 
 			/* Ensure there's no garbage on metadata */
-			hints = (struct xdp_meta_generic___igc *)
+			hints = (struct xdp_meta_generic *)
 				((char *)xsk_buff_raw_get_data(pool, xdp_desc.addr)
 				 - sizeof(*hints));
 			spin_lock_irqsave(&adapter->ptp_tx_lock, flags);
@@ -2759,11 +2760,11 @@ static bool igc_xsk_complete_tx_tstamp(struct igc_adapter *adapter,
 			struct xdp_desc xdp_desc = tstamp->pending_ts_pkt.xsk_desc;
 
 			if (xdp_desc.addr == tx_buffer->xsk_desc.addr) {
-				struct xdp_meta_generic___igc *hints;
+				struct xdp_meta_generic *hints;
 				struct xsk_buff_pool *pool;
 
 				pool = tstamp->xsk_pool;
-				hints = (struct xdp_meta_generic___igc *)
+				hints = (struct xdp_meta_generic *)
 					((char *)xsk_buff_raw_get_data(pool, xdp_desc.addr)
 					 - sizeof(*hints));
 				if (!hints->tx_tstamp) {
